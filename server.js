@@ -11,26 +11,18 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 // =============================================================================
-// COST PROTECTION CONFIGURATION - ADJUST THESE TO YOUR COMFORT LEVEL
+// COST PROTECTION CONFIGURATION
 // =============================================================================
 const COST_PROTECTION = {
-  // Estimated cost per recipe (be conservative, estimate high)
-  COST_PER_URL_RECIPE: 0.03,      // $0.03 per URL recipe
-  COST_PER_PHOTO_RECIPE: 0.06,    // $0.06 per photo recipe
-  
-  // Spending limits
-  DAILY_SPENDING_LIMIT: 10,       // Pause free tier if daily costs exceed $10
-  MONTHLY_SPENDING_LIMIT: 100,    // Hard stop if monthly costs exceed $100
-  
-  // Free tier limits (can be adjusted dynamically)
+  COST_PER_URL_RECIPE: 0.03,
+  COST_PER_PHOTO_RECIPE: 0.06,
+  DAILY_SPENDING_LIMIT: 10,
+  MONTHLY_SPENDING_LIMIT: 100,
   FREE_RECIPES_PER_MONTH: 3,
-  MAX_FREE_USERS_PER_DAY: 100,    // Cap new free users per day
-  
-  // Alert thresholds (percentage of limits)
-  ALERT_THRESHOLD: 0.7,           // Alert at 70% of limit
+  MAX_FREE_USERS_PER_DAY: 100,
+  ALERT_THRESHOLD: 0.7,
 };
 
-// Spending tracker (use Redis in production)
 const spendingTracker = {
   today: { date: new Date().toDateString(), amount: 0, freeRecipes: 0, newFreeUsers: 0 },
   month: { month: new Date().toISOString().slice(0, 7), amount: 0 },
@@ -38,7 +30,6 @@ const spendingTracker = {
   pauseReason: null,
 };
 
-// Reset daily tracker at midnight
 function checkAndResetDaily() {
   const today = new Date().toDateString();
   if (spendingTracker.today.date !== today) {
@@ -47,12 +38,10 @@ function checkAndResetDaily() {
     if (spendingTracker.pauseReason === 'daily_limit') {
       spendingTracker.paused = false;
       spendingTracker.pauseReason = null;
-      console.log('✅ Daily limit reset - free tier re-enabled');
     }
   }
   const currentMonth = new Date().toISOString().slice(0, 7);
   if (spendingTracker.month.month !== currentMonth) {
-    console.log(`📊 Last month's total spending: $${spendingTracker.month.amount.toFixed(2)}`);
     spendingTracker.month = { month: currentMonth, amount: 0 };
     if (spendingTracker.pauseReason === 'monthly_limit') {
       spendingTracker.paused = false;
@@ -63,7 +52,6 @@ function checkAndResetDaily() {
 
 function trackSpending(amount, isFreeUser) {
   checkAndResetDaily();
-  
   spendingTracker.today.amount += amount;
   spendingTracker.month.amount += amount;
   if (isFreeUser) spendingTracker.today.freeRecipes++;
@@ -71,13 +59,10 @@ function trackSpending(amount, isFreeUser) {
   if (spendingTracker.today.amount >= COST_PROTECTION.DAILY_SPENDING_LIMIT) {
     spendingTracker.paused = true;
     spendingTracker.pauseReason = 'daily_limit';
-    console.log('⚠️ DAILY SPENDING LIMIT REACHED - Free tier paused');
   }
-  
   if (spendingTracker.month.amount >= COST_PROTECTION.MONTHLY_SPENDING_LIMIT) {
     spendingTracker.paused = true;
     spendingTracker.pauseReason = 'monthly_limit';
-    console.log('🛑 MONTHLY SPENDING LIMIT REACHED - Free tier paused');
   }
 }
 
@@ -138,7 +123,15 @@ function getRemainingRecipes(user) {
 // =============================================================================
 // MIDDLEWARE
 // =============================================================================
-app.use(cors({ origin: process.env.FRONTEND_URL || '*', credentials: true }));
+app.use(cors({ 
+  origin: function(origin, callback) {
+    // Allow requests with no origin (mobile apps, curl, etc)
+    if (!origin) return callback(null, true);
+    // Allow any origin for now (you can restrict this later)
+    return callback(null, true);
+  },
+  credentials: true 
+}));
 app.use(express.json({ limit: '50mb' }));
 
 // =============================================================================
@@ -188,11 +181,39 @@ app.get('/api/auth/me', async (req, res) => {
 });
 
 // =============================================================================
+// HELPER: Fetch webpage content
+// =============================================================================
+async function fetchWebpage(url) {
+  try {
+    const response = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+      }
+    });
+    const html = await response.text();
+    // Strip HTML tags and get text content (simple extraction)
+    const text = html
+      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 15000); // Limit to ~15k chars to avoid token limits
+    return text;
+  } catch (err) {
+    console.error('Failed to fetch webpage:', err);
+    return null;
+  }
+}
+
+// =============================================================================
 // RECIPES
 // =============================================================================
 app.post('/api/recipe/clean-url', async (req, res) => {
   const { url } = req.body;
   const email = req.headers['x-user-email'];
+  
+  console.log(`📥 Recipe request for: ${url}`);
   
   const user = email ? getUser(email) : getUser(`anon_${req.ip}`);
   if (!user) return res.status(503).json({ error: 'Service limited', upgrade: true, message: 'Upgrade for instant access!' });
@@ -205,25 +226,47 @@ app.post('/api/recipe/clean-url', async (req, res) => {
   const isFreeUser = !user.subscription;
   
   try {
+    // Fetch the webpage content first
+    console.log('🌐 Fetching webpage...');
+    const pageContent = await fetchWebpage(url);
+    
+    if (!pageContent) {
+      return res.status(400).json({ error: 'Could not fetch recipe page. Please check the URL.' });
+    }
+    
+    console.log('🤖 Calling Claude API...');
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 2500,
-      tools: [{ type: 'web_search_20250305', name: 'web_search' }],
       messages: [{
         role: 'user',
-        content: `Find this recipe and return a cleaned version: ${url}
+        content: `Extract the recipe from this webpage content and return a cleaned version.
 
-RESPOND WITH ONLY VALID JSON:
-{"title":"Recipe name","servings":4,"prepTime":"15 min","cookTime":"30 min","imageUrl":"url or null","ingredients":["500g / 1.1 lb chicken"],"steps":[{"instruction":"Preheat oven to 400°F / 200°C.","ingredients":[]}],"tips":[],"source":"Website","sourceUrl":"${url}","author":null}
+WEBPAGE CONTENT:
+${pageContent}
 
-Dual units always. One action per step.`
+RESPOND WITH ONLY VALID JSON (no markdown, no backticks, no explanation):
+{"title":"Recipe name","servings":4,"prepTime":"15 min","cookTime":"30 min","imageUrl":null,"ingredients":["500g / 1.1 lb ingredient","2 tbsp / 30ml oil"],"steps":[{"instruction":"Step description here.","ingredients":["relevant ingredient"]}],"tips":["optional tip"],"source":"Website name","sourceUrl":"${url}","author":"Author name or null"}
+
+RULES:
+- Every measurement MUST have dual units: "500g / 1.1 lb" or "1 cup / 240ml"
+- Temperatures in both: "400°F / 200°C"
+- Each step has "instruction" and "ingredients" array (ingredients used in that step)
+- One clear action per step
+- Extract tips if mentioned
+- Return ONLY the JSON, nothing else`
       }]
     });
 
+    console.log('✅ Claude responded');
+    
     let text = response.content?.map(c => c.text || '').join('') || '';
     text = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
     const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error('No JSON');
+    if (!jsonMatch) {
+      console.error('No JSON found in response:', text.slice(0, 200));
+      throw new Error('No JSON found in response');
+    }
     
     const recipe = JSON.parse(jsonMatch[0]);
     if (!recipe.sourceUrl) recipe.sourceUrl = url;
@@ -231,16 +274,19 @@ Dual units always. One action per step.`
     user.recipesUsedThisMonth++;
     trackSpending(COST_PROTECTION.COST_PER_URL_RECIPE, isFreeUser);
     
+    console.log(`✅ Recipe cleaned: ${recipe.title}`);
     res.json({ recipe, recipesRemaining: getRemainingRecipes(user) });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Failed to clean recipe' });
+    console.error('Recipe clean error:', err);
+    res.status(500).json({ error: 'Failed to clean recipe. Please try again.' });
   }
 });
 
 app.post('/api/recipe/clean-photo', async (req, res) => {
   const { photos } = req.body;
   const email = req.headers['x-user-email'];
+  
+  console.log(`📷 Photo recipe request with ${photos?.length || 0} photos`);
   
   const user = email ? getUser(email) : getUser(`anon_${req.ip}`);
   if (!user) return res.status(503).json({ error: 'Service limited', upgrade: true });
@@ -258,9 +304,18 @@ app.post('/api/recipe/clean-photo', async (req, res) => {
     
     content.push({
       type: 'text',
-      text: `Extract recipe. Return ONLY JSON: {"title":"","servings":4,"prepTime":"","cookTime":"","imageUrl":null,"ingredients":[],"steps":[{"instruction":"","ingredients":[]}],"tips":[],"source":"Cookbook","sourceUrl":null,"author":null}. Dual units.`
+      text: `Extract the recipe from these cookbook photos.
+
+RESPOND WITH ONLY VALID JSON (no markdown, no backticks):
+{"title":"Recipe name","servings":4,"prepTime":"15 min","cookTime":"30 min","imageUrl":null,"ingredients":["500g / 1.1 lb ingredient"],"steps":[{"instruction":"Step text","ingredients":[]}],"tips":[],"source":"Cookbook name or 'Cookbook'","sourceUrl":null,"author":"Author or null"}
+
+RULES:
+- Dual units always: "500g / 1.1 lb", "1 cup / 240ml", "400°F / 200°C"
+- One action per step
+- Return ONLY the JSON`
     });
 
+    console.log('🤖 Calling Claude API for photos...');
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 2500,
@@ -276,15 +331,16 @@ app.post('/api/recipe/clean-photo', async (req, res) => {
     user.recipesUsedThisMonth++;
     trackSpending(COST_PROTECTION.COST_PER_PHOTO_RECIPE, isFreeUser);
     
+    console.log(`✅ Photo recipe cleaned: ${recipe.title}`);
     res.json({ recipe, recipesRemaining: getRemainingRecipes(user) });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Failed to read recipe' });
+    console.error('Photo clean error:', err);
+    res.status(500).json({ error: 'Failed to read recipe from photos' });
   }
 });
 
 // =============================================================================
-// PAYMENTS - Maximum conversion
+// PAYMENTS
 // =============================================================================
 app.post('/api/payments/create-checkout', async (req, res) => {
   const { plan, email } = req.body;
@@ -303,7 +359,6 @@ app.post('/api/payments/create-checkout', async (req, res) => {
     user.stripeCustomerId = customer.id;
   }
   
-  // Create checkout with ALL payment methods enabled
   const session = await stripe.checkout.sessions.create({
     customer: user.stripeCustomerId,
     line_items: [{ price: prices[plan], quantity: 1 }],
@@ -311,15 +366,9 @@ app.post('/api/payments/create-checkout', async (req, res) => {
     success_url: `${process.env.FRONTEND_URL}?success=true&plan=${plan}`,
     cancel_url: `${process.env.FRONTEND_URL}?canceled=true`,
     metadata: { email, plan },
-    // FRICTION REDUCERS:
-    billing_address_collection: 'auto',  // Only ask if needed
-    allow_promotion_codes: true,          // Let users enter promo codes
-    tax_id_collection: { enabled: false }, // Don't ask for tax ID
-    // These enable Apple Pay, Google Pay, Link automatically in Stripe Dashboard
-    // Enable in: Dashboard > Settings > Payment methods
+    billing_address_collection: 'auto',
+    allow_promotion_codes: true,
     payment_method_types: ['card'],
-    // For Link (one-click checkout):
-    consent_collection: { terms_of_service: 'none' },
   });
 
   res.json({ url: session.url });
@@ -371,6 +420,67 @@ app.post('/api/payments/portal', async (req, res) => {
 });
 
 // =============================================================================
+// FEEDBACK & RATINGS
+// =============================================================================
+const feedback = [];
+const ratings = [];
+
+app.post('/api/feedback', (req, res) => {
+  const { message, type } = req.body;
+  const email = req.headers['x-user-email'] || null;
+  
+  if (!message?.trim()) return res.status(400).json({ error: 'Message required' });
+  
+  feedback.unshift({
+    id: Date.now(),
+    message: message.trim(),
+    type: type || 'idea',
+    email,
+    createdAt: new Date().toISOString(),
+    status: 'new',
+    notified: false,
+  });
+  
+  console.log(`💬 Feedback from ${email || 'anonymous'}: ${message.slice(0, 50)}...`);
+  res.json({ success: true, message: 'Thanks! We read every suggestion.' });
+});
+
+app.post('/api/rating', (req, res) => {
+  const { stars } = req.body;
+  const email = req.headers['x-user-email'] || null;
+  
+  if (!stars || stars < 1 || stars > 5) return res.status(400).json({ error: 'Invalid rating' });
+  
+  const identifier = email || req.ip;
+  const existing = ratings.find(r => r.identifier === identifier);
+  
+  if (existing) {
+    existing.stars = stars;
+    existing.updatedAt = new Date().toISOString();
+  } else {
+    ratings.push({ id: Date.now(), stars, identifier, email, createdAt: new Date().toISOString() });
+  }
+  
+  res.json({ success: true });
+});
+
+app.get('/api/ratings/summary', (req, res) => {
+  if (ratings.length === 0) return res.json({ average: 0, count: 0, display: null });
+  
+  const sum = ratings.reduce((acc, r) => acc + r.stars, 0);
+  const average = sum / ratings.length;
+  const count = ratings.length;
+  
+  const display = count >= 5 ? {
+    average: Math.round(average * 10) / 10,
+    count,
+    text: `${average.toFixed(1)} ★ from ${count} cooks`,
+  } : null;
+  
+  res.json({ average, count, display });
+});
+
+// =============================================================================
 // SAVED RECIPES
 // =============================================================================
 app.get('/api/recipes/saved', (req, res) => {
@@ -397,166 +507,12 @@ app.delete('/api/recipes/:id', (req, res) => {
 });
 
 // =============================================================================
-// FEEDBACK & RATINGS
-// =============================================================================
-const feedback = [];
-const ratings = [];
-
-app.post('/api/feedback', (req, res) => {
-  const { message, type } = req.body; // type: 'idea' | 'bug' | 'other'
-  const email = req.headers['x-user-email'] || null;
-  
-  if (!message?.trim()) return res.status(400).json({ error: 'Message required' });
-  
-  const entry = {
-    id: Date.now(),
-    message: message.trim(),
-    type: type || 'idea',
-    email,
-    createdAt: new Date().toISOString(),
-    status: 'new', // 'new' | 'planned' | 'shipped'
-    notified: false,
-  };
-  
-  feedback.unshift(entry);
-  console.log(`💬 New feedback from ${email || 'anonymous'}: ${message.slice(0, 50)}...`);
-  
-  res.json({ success: true, message: 'Thanks! We read every suggestion.' });
-});
-
-app.post('/api/rating', (req, res) => {
-  const { stars } = req.body; // 1-5
-  const email = req.headers['x-user-email'] || null;
-  
-  if (!stars || stars < 1 || stars > 5) return res.status(400).json({ error: 'Invalid rating' });
-  
-  // Check if user already rated (by email or IP)
-  const identifier = email || req.ip;
-  const existing = ratings.find(r => r.identifier === identifier);
-  
-  if (existing) {
-    existing.stars = stars;
-    existing.updatedAt = new Date().toISOString();
-  } else {
-    ratings.push({
-      id: Date.now(),
-      stars,
-      identifier,
-      email,
-      createdAt: new Date().toISOString(),
-    });
-  }
-  
-  res.json({ success: true });
-});
-
-app.get('/api/ratings/summary', (req, res) => {
-  if (ratings.length === 0) {
-    return res.json({ average: 0, count: 0, display: null });
-  }
-  
-  const sum = ratings.reduce((acc, r) => acc + r.stars, 0);
-  const average = sum / ratings.length;
-  const count = ratings.length;
-  
-  // Only show if we have enough ratings (social proof threshold)
-  const display = count >= 5 ? {
-    average: Math.round(average * 10) / 10,
-    count,
-    text: `${average.toFixed(1)} ★ from ${count} cooks`,
-  } : null;
-  
-  res.json({ average, count, display });
-});
-
-// =============================================================================
 // ADMIN
 // =============================================================================
-
-// Get all feedback
 app.get('/api/admin/feedback', (req, res) => {
   if (req.headers['x-admin-key'] !== process.env.ADMIN_KEY) return res.status(401).json({ error: 'Unauthorized' });
-  
-  res.json({
-    total: feedback.length,
-    new: feedback.filter(f => f.status === 'new').length,
-    planned: feedback.filter(f => f.status === 'planned').length,
-    shipped: feedback.filter(f => f.status === 'shipped').length,
-    items: feedback,
-  });
+  res.json({ total: feedback.length, new: feedback.filter(f => f.status === 'new').length, items: feedback });
 });
-
-// Update feedback status and optionally notify user
-app.patch('/api/admin/feedback/:id', async (req, res) => {
-  if (req.headers['x-admin-key'] !== process.env.ADMIN_KEY) return res.status(401).json({ error: 'Unauthorized' });
-  
-  const { status, notify } = req.body;
-  const id = parseInt(req.params.id);
-  const item = feedback.find(f => f.id === id);
-  
-  if (!item) return res.status(404).json({ error: 'Not found' });
-  
-  if (status) item.status = status;
-  
-  // Send notification email if requested and status is 'shipped'
-  if (notify && status === 'shipped' && item.email && !item.notified) {
-    // TODO: Implement email sending (see below for options)
-    // For now, just mark as notified and log
-    console.log(`📧 Would notify ${item.email}: Your suggestion is now live!`);
-    console.log(`   Suggestion: "${item.message.slice(0, 100)}..."`);
-    
-    // Example with SendGrid (uncomment and configure):
-    // await sendNotificationEmail(item.email, item.message);
-    
-    item.notified = true;
-    item.notifiedAt = new Date().toISOString();
-  }
-  
-  res.json({ success: true, item });
-});
-
-// Bulk notify all shipped but not notified
-app.post('/api/admin/feedback/notify-shipped', async (req, res) => {
-  if (req.headers['x-admin-key'] !== process.env.ADMIN_KEY) return res.status(401).json({ error: 'Unauthorized' });
-  
-  const toNotify = feedback.filter(f => f.status === 'shipped' && f.email && !f.notified);
-  
-  for (const item of toNotify) {
-    console.log(`📧 Notifying ${item.email} about shipped feature`);
-    // await sendNotificationEmail(item.email, item.message);
-    item.notified = true;
-    item.notifiedAt = new Date().toISOString();
-  }
-  
-  res.json({ success: true, notified: toNotify.length });
-});
-
-/*
-// EMAIL NOTIFICATION SETUP
-// Option 1: SendGrid (recommended, free tier available)
-// npm install @sendgrid/mail
-
-import sgMail from '@sendgrid/mail';
-sgMail.setApiKey(process.env.SENDGRID_API_KEY);
-
-async function sendNotificationEmail(to, suggestion) {
-  await sgMail.send({
-    to,
-    from: 'hello@mise.app',
-    subject: '🎉 Your mise suggestion is now live!',
-    text: `Hey! Remember when you suggested: "${suggestion.slice(0, 100)}..."? We just shipped it! Open mise to check it out. Thanks for making mise better! - The mise team`,
-    html: `
-      <p>Hey!</p>
-      <p>Remember when you suggested:</p>
-      <blockquote style="border-left: 3px solid #4ade80; padding-left: 12px; color: #666;">${suggestion.slice(0, 200)}...</blockquote>
-      <p><strong>We just shipped it!</strong> 🚀</p>
-      <p><a href="https://mise.app" style="color: #4ade80;">Open mise</a> to check it out.</p>
-      <p>Thanks for making mise better!</p>
-      <p>- The mise team</p>
-    `,
-  });
-}
-*/
 
 app.get('/api/admin/stats', (req, res) => {
   if (req.headers['x-admin-key'] !== process.env.ADMIN_KEY) return res.status(401).json({ error: 'Unauthorized' });

@@ -229,10 +229,20 @@ function validateAndFixRecipe(recipe) {
 // =============================================================================
 // HELPER: Use Claude to fix recipe issues
 // =============================================================================
-async function fixRecipeIssues(recipe, issues) {
+async function fixRecipeIssues(recipe, issues, targetLanguage = 'en') {
   if (issues.length === 0) return recipe;
   
   console.log('🔧 Fixing recipe issues:', issues.join(', '));
+  
+  const languageInstructions = {
+    en: 'Output everything in English.',
+    es: 'Output everything in Spanish (Español).',
+    fr: 'Output everything in French (Français).',
+    pt: 'Output everything in Portuguese (Português).',
+    zh: 'Output everything in Simplified Chinese (简体中文).',
+    hi: 'Output everything in Hindi (हिन्दी).',
+    ar: 'Output everything in Arabic (العربية). Keep JSON keys in English, translate values only.',
+  };
   
   try {
     const response = await anthropic.messages.create({
@@ -253,6 +263,7 @@ RULES:
 - Each step should be ONE clear action (max 300 characters)
 - Each step needs an "ingredients" array with EXACT strings from the main ingredients array used in that step
 - Dual units on all measurements: "500g / 1.1 lb", "1 cup / 240ml", "400°F / 200°C"
+- ${languageInstructions[targetLanguage] || languageInstructions.en}
 - Return ONLY valid JSON, no explanation`
       }]
     });
@@ -414,24 +425,36 @@ function convertSchemaToRecipe(schema, sourceUrl) {
 // =============================================================================
 // HELPER: Use Claude to enhance recipe with dual units (lightweight call)
 // =============================================================================
-async function enhanceRecipeWithDualUnits(recipe) {
+async function enhanceRecipeWithDualUnits(recipe, targetLanguage = 'en') {
   try {
     console.log('🔄 Enhancing recipe with dual units...');
+    
+    const languageInstructions = {
+      en: 'Output everything in English.',
+      es: 'Output everything in Spanish (Español).',
+      fr: 'Output everything in French (Français).',
+      pt: 'Output everything in Portuguese (Português).',
+      zh: 'Output everything in Simplified Chinese (简体中文).',
+      hi: 'Output everything in Hindi (हिन्दी).',
+      ar: 'Output everything in Arabic (العربية). Note: Keep the JSON structure in English keys, only translate the values.',
+    };
+    
     const response = await anthropic.messages.create({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 2500,
       messages: [{
         role: 'user',
-        content: `Convert this recipe to have dual units. Return ONLY valid JSON, no explanation.
+        content: `Convert this recipe to have dual units and translate if needed. Return ONLY valid JSON, no explanation.
 
 INPUT:
 ${JSON.stringify(recipe, null, 2)}
 
 RULES:
 - Add dual units to ALL measurements: "500g / 1.1 lb", "1 cup / 240ml", "400°F / 200°C"
-- Keep everything else exactly the same
+- Keep everything else exactly the same structure
 - For each step, add an "ingredients" array with the EXACT ingredient strings (with dual units) used in that step
-- Return the complete recipe JSON`
+- ${languageInstructions[targetLanguage] || languageInstructions.en}
+- Return the complete recipe JSON with same field names (title, servings, ingredients, steps, etc.)`
       }]
     });
     
@@ -467,10 +490,11 @@ function stripHtml(html) {
 // RECIPES
 // =============================================================================
 app.post('/api/recipe/clean-url', async (req, res) => {
-  const { url } = req.body;
+  const { url, language } = req.body;
+  const targetLanguage = ['en', 'es', 'fr', 'pt', 'zh', 'hi', 'ar'].includes(language) ? language : 'en';
   const email = req.headers['x-user-email'];
   
-  console.log(`📥 Recipe request for: ${url}`);
+  console.log(`📥 Recipe request for: ${url} (language: ${targetLanguage})`);
   
   const user = email ? getUser(email) : getUser(`anon_${req.ip}`);
   if (!user) return res.status(503).json({ error: 'Service limited', upgrade: true, message: 'Upgrade for instant access!' });
@@ -504,11 +528,11 @@ app.post('/api/recipe/clean-url', async (req, res) => {
       
       // Fix any issues found
       if (issues.length > 0) {
-        recipe = await fixRecipeIssues(recipe, issues);
+        recipe = await fixRecipeIssues(recipe, issues, targetLanguage);
       }
       
-      // Quick enhancement with Haiku for dual units
-      recipe = await enhanceRecipeWithDualUnits(recipe);
+      // Quick enhancement with Haiku for dual units and translation
+      recipe = await enhanceRecipeWithDualUnits(recipe, targetLanguage);
       
       // Final validation
       const finalCheck = validateAndFixRecipe(recipe);
@@ -524,6 +548,16 @@ app.post('/api/recipe/clean-url', async (req, res) => {
     // SLOW PATH: Full Claude extraction (fallback for sites without schema)
     console.log('🐢 Using slow path (no schema, full extraction)');
     const pageContent = stripHtml(html);
+    
+    const languageInstructions = {
+      en: 'Output everything in English.',
+      es: 'Output everything in Spanish (Español).',
+      fr: 'Output everything in French (Français).',
+      pt: 'Output everything in Portuguese (Português).',
+      zh: 'Output everything in Simplified Chinese (简体中文).',
+      hi: 'Output everything in Hindi (हिन्दी).',
+      ar: 'Output everything in Arabic (العربية). Keep JSON keys in English, translate values only.',
+    };
     
     console.log('🤖 Calling Claude API...');
     const response = await anthropic.messages.create({
@@ -546,6 +580,7 @@ CRITICAL RULES:
 - IMPORTANT: The "ingredients" array in each step MUST copy-paste EXACT strings from the main "ingredients" array - same wording, same amounts, same units. Do not rephrase or abbreviate.
 - One clear action per step
 - Extract tips if mentioned
+- ${languageInstructions[targetLanguage] || languageInstructions.en}
 - Return ONLY the JSON, nothing else`
       }]
     });
@@ -568,7 +603,7 @@ CRITICAL RULES:
     recipe = validatedRecipe;
     
     if (issues.length > 0) {
-      recipe = await fixRecipeIssues(recipe, issues);
+      recipe = await fixRecipeIssues(recipe, issues, targetLanguage);
     }
     
     user.recipesUsedThisMonth++;
@@ -583,10 +618,11 @@ CRITICAL RULES:
 });
 
 app.post('/api/recipe/clean-photo', async (req, res) => {
-  const { photos } = req.body;
+  const { photos, language } = req.body;
+  const targetLanguage = ['en', 'es', 'fr', 'pt', 'zh', 'hi', 'ar'].includes(language) ? language : 'en';
   const email = req.headers['x-user-email'];
   
-  console.log(`📷 Photo recipe request with ${photos?.length || 0} photos`);
+  console.log(`📷 Photo recipe request with ${photos?.length || 0} photos (language: ${targetLanguage})`);
   
   const user = email ? getUser(email) : getUser(`anon_${req.ip}`);
   if (!user) return res.status(503).json({ error: 'Service limited', upgrade: true });
@@ -595,6 +631,16 @@ app.post('/api/recipe/clean-photo', async (req, res) => {
   if (!canClean.allowed) return res.status(402).json({ error: 'Limit reached', upgrade: true });
   
   const isFreeUser = !user.subscription;
+  
+  const languageInstructions = {
+    en: 'Output everything in English.',
+    es: 'Output everything in Spanish (Español).',
+    fr: 'Output everything in French (Français).',
+    pt: 'Output everything in Portuguese (Português).',
+    zh: 'Output everything in Simplified Chinese (简体中文).',
+    hi: 'Output everything in Hindi (हिन्दी).',
+    ar: 'Output everything in Arabic (العربية). Keep JSON keys in English, translate values only.',
+  };
   
   try {
     // Compress images if too many - limit to 4 photos max
@@ -616,6 +662,7 @@ CRITICAL RULES:
 - Dual units always: "500g / 1.1 lb", "1 cup / 240ml", "400°F / 200°C"
 - One action per step
 - IMPORTANT: The "ingredients" array in each step MUST copy-paste EXACT strings from the main "ingredients" array - same wording, same amounts, same units. Do not rephrase or abbreviate.
+- ${languageInstructions[targetLanguage] || languageInstructions.en}
 - Return ONLY the JSON`
     });
 
@@ -638,7 +685,7 @@ CRITICAL RULES:
     recipe = validatedRecipe;
     
     if (issues.length > 0) {
-      recipe = await fixRecipeIssues(recipe, issues);
+      recipe = await fixRecipeIssues(recipe, issues, targetLanguage);
     }
     
     user.recipesUsedThisMonth++;

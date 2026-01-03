@@ -700,6 +700,204 @@ CRITICAL RULES:
 });
 
 // =============================================================================
+// YOUTUBE RECIPE EXTRACTION
+// =============================================================================
+async function extractYoutubeVideoId(url) {
+  const patterns = [
+    /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([^&\n?#]+)/,
+    /youtube\.com\/shorts\/([^&\n?#]+)/,
+  ];
+  for (const pattern of patterns) {
+    const match = url.match(pattern);
+    if (match) return match[1];
+  }
+  return null;
+}
+
+async function getYoutubeTranscript(videoId) {
+  try {
+    // Try to get transcript from YouTube's timedtext API
+    // First, get the video page to find available captions
+    const videoPageResponse = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+      }
+    });
+    const html = await videoPageResponse.text();
+    
+    // Extract caption track URL from the page
+    const captionMatch = html.match(/"captions":\s*({[^}]+})/);
+    if (!captionMatch) {
+      // Try alternative method - look for timedtext in the page
+      const timedTextMatch = html.match(/timedtext[^"]*lang=([^&"]+)/);
+      if (timedTextMatch) {
+        const lang = timedTextMatch[1];
+        const transcriptUrl = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${lang}`;
+        const transcriptResponse = await fetch(transcriptUrl);
+        const transcriptXml = await transcriptResponse.text();
+        // Parse XML transcript
+        const textMatches = transcriptXml.matchAll(/<text[^>]*>([^<]+)<\/text>/g);
+        const segments = [];
+        for (const match of textMatches) {
+          segments.push(match[1].replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#39;/g, "'").replace(/&quot;/g, '"'));
+        }
+        if (segments.length > 0) {
+          return segments.join(' ');
+        }
+      }
+    }
+    
+    // Try using a transcript extraction service as fallback
+    // Look for playerCaptionsTracklistRenderer
+    const captionsListMatch = html.match(/playerCaptionsTracklistRenderer":\s*(\{[^}]+\})/);
+    if (captionsListMatch) {
+      try {
+        // Find baseUrl for captions
+        const baseUrlMatch = html.match(/"baseUrl":\s*"([^"]+timedtext[^"]+)"/);
+        if (baseUrlMatch) {
+          let captionUrl = baseUrlMatch[1].replace(/\\u0026/g, '&');
+          const captionResponse = await fetch(captionUrl);
+          const captionData = await captionResponse.text();
+          
+          // Parse the caption data (could be JSON or XML)
+          if (captionData.startsWith('{')) {
+            const json = JSON.parse(captionData);
+            if (json.events) {
+              return json.events
+                .filter(e => e.segs)
+                .map(e => e.segs.map(s => s.utf8).join(''))
+                .join(' ');
+            }
+          } else {
+            // XML format
+            const textMatches = captionData.matchAll(/<text[^>]*>([^<]+)<\/text>/g);
+            const segments = [];
+            for (const match of textMatches) {
+              segments.push(match[1]);
+            }
+            return segments.join(' ');
+          }
+        }
+      } catch (e) {
+        console.log('Caption extraction error:', e.message);
+      }
+    }
+    
+    // If no transcript available, try to get video description and title
+    const titleMatch = html.match(/<title>([^<]+)<\/title>/);
+    const descMatch = html.match(/"description":\s*\{"simpleText":\s*"([^"]+)"/);
+    
+    if (titleMatch || descMatch) {
+      return `Video Title: ${titleMatch ? titleMatch[1] : 'Unknown'}\n\nDescription: ${descMatch ? descMatch[1].replace(/\\n/g, '\n') : 'No description'}`;
+    }
+    
+    return null;
+  } catch (err) {
+    console.error('YouTube transcript error:', err);
+    return null;
+  }
+}
+
+app.post('/api/recipe/clean-youtube', async (req, res) => {
+  const { url, language } = req.body;
+  const targetLanguage = ['en', 'es', 'fr', 'pt', 'zh', 'hi', 'ar'].includes(language) ? language : 'en';
+  const email = req.headers['x-user-email'];
+  
+  console.log(`🎬 YouTube recipe request for: ${url} (language: ${targetLanguage})`);
+  
+  const user = email ? getUser(email) : getUser(`anon_${req.ip}`);
+  if (!user) return res.status(503).json({ error: 'Service limited', upgrade: true, message: 'Upgrade for instant access!' });
+  
+  const canClean = canCleanRecipe(user);
+  if (!canClean.allowed) {
+    return res.status(402).json({ error: 'Limit reached', upgrade: true, message: 'Upgrade to continue!' });
+  }
+  
+  const isFreeUser = !user.subscription;
+  
+  const languageInstructions = {
+    en: 'Output everything in English.',
+    es: 'Output everything in Spanish (Español).',
+    fr: 'Output everything in French (Français).',
+    pt: 'Output everything in Portuguese (Português).',
+    zh: 'Output everything in Simplified Chinese (简体中文).',
+    hi: 'Output everything in Hindi (हिन्दी).',
+    ar: 'Output everything in Arabic (العربية). Keep JSON keys in English, translate values only.',
+  };
+  
+  try {
+    const videoId = await extractYoutubeVideoId(url);
+    if (!videoId) {
+      return res.status(400).json({ error: 'Invalid YouTube URL. Please check the link.' });
+    }
+    
+    console.log('🎬 Extracting transcript for video:', videoId);
+    const transcript = await getYoutubeTranscript(videoId);
+    
+    if (!transcript || transcript.length < 100) {
+      return res.status(400).json({ error: 'Could not extract transcript. This video may not have captions available.' });
+    }
+    
+    console.log('🤖 Calling Claude API for YouTube transcript...');
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 3000,
+      messages: [{
+        role: 'user',
+        content: `Extract the recipe from this cooking video transcript. The speaker is demonstrating how to cook a dish.
+
+VIDEO TRANSCRIPT:
+${transcript.slice(0, 12000)}
+
+RESPOND WITH ONLY VALID JSON (no markdown, no backticks, no explanation):
+{"title":"Recipe name","servings":4,"prepTime":"15 min","cookTime":"30 min","imageUrl":null,"ingredients":["500g / 1.1 lb ingredient","2 tbsp / 30ml oil"],"steps":[{"instruction":"Step description here.","ingredients":["500g / 1.1 lb ingredient"]}],"tips":["optional tip from the video"],"source":"YouTube","sourceUrl":"${url}","author":"Channel name or null"}
+
+CRITICAL RULES:
+- Extract all ingredients mentioned, even if amounts are approximate ("a handful", "some") - convert to reasonable measurements
+- Every measurement MUST have dual units: "500g / 1.1 lb" or "1 cup / 240ml"
+- Temperatures in both: "400°F / 200°C"
+- Each step has "instruction" and "ingredients" array
+- IMPORTANT: The "ingredients" array in each step MUST copy-paste EXACT strings from the main "ingredients" array
+- One clear action per step
+- Include any tips or tricks the chef mentions
+- ${languageInstructions[targetLanguage] || languageInstructions.en}
+- Return ONLY the JSON, nothing else`
+      }]
+    });
+
+    console.log('✅ Claude responded');
+    
+    let text = response.content?.map(c => c.text || '').join('') || '';
+    text = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      console.error('No JSON found in response:', text.slice(0, 200));
+      throw new Error('No JSON found in response');
+    }
+    
+    let recipe = JSON.parse(jsonMatch[0]);
+    if (!recipe.sourceUrl) recipe.sourceUrl = url;
+    
+    // Validate and fix any issues
+    const { recipe: validatedRecipe, issues } = validateAndFixRecipe(recipe);
+    recipe = validatedRecipe;
+    
+    if (issues.length > 0) {
+      recipe = await fixRecipeIssues(recipe, issues, targetLanguage);
+    }
+    
+    user.recipesUsedThisMonth++;
+    trackSpending(COST_PROTECTION.COST_PER_URL_RECIPE * 1.5, isFreeUser); // YouTube costs a bit more
+    
+    console.log(`✅ YouTube recipe cleaned: ${recipe.title} - ${recipe.steps?.length} steps`);
+    res.json({ recipe, recipesRemaining: getRemainingRecipes(user) });
+  } catch (err) {
+    console.error('YouTube clean error:', err);
+    res.status(500).json({ error: 'Failed to extract recipe from video. Please try again.' });
+  }
+});
+
+// =============================================================================
 // PAYMENTS
 // =============================================================================
 app.post('/api/payments/create-checkout', async (req, res) => {

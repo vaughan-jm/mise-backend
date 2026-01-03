@@ -683,7 +683,25 @@ app.post('/api/recipe/clean-photo', async (req, res) => {
     
     content.push({
       type: 'text',
-      text: `Extract recipe from photos. Return ONLY valid JSON:\n{"title":"","servings":4,"prepTime":"","cookTime":"","imageUrl":null,"ingredients":["500g / 1.1 lb item"],"steps":[{"instruction":"","ingredients":[]}],"tips":[],"source":"Cookbook","sourceUrl":null,"author":null}\n\nRULES:\n- Dual units\n- Each step has ingredients array\n- ${langInstr[targetLanguage] || langInstr.en}`
+      text: `Extract the recipe from these photos. The images may contain:
+- Printed cookbook pages
+- Handwritten recipes (cursive or print)
+- Recipe cards with notes
+- Scribbled notes on paper or napkins
+- Screenshots of recipes
+
+CAREFULLY READ ALL TEXT including handwritten notes, annotations, and margin scribbles. Handwriting may be messy - do your best to interpret it.
+
+Return ONLY valid JSON:
+{"title":"Recipe name","servings":4,"prepTime":"15 min","cookTime":"30 min","imageUrl":null,"ingredients":["500g / 1.1 lb ingredient"],"steps":[{"instruction":"Step description","ingredients":["500g / 1.1 lb ingredient"]}],"tips":[],"source":"Cookbook","sourceUrl":null,"author":null}
+
+RULES:
+- If handwriting is unclear, make your best guess based on context (e.g. "1 tsp s___" is probably "1 tsp salt" or "1 tsp sugar")
+- Convert vague amounts to standard measurements ("a handful" → "1/2 cup / 60g", "some" → "2 tbsp / 30ml")
+- Dual units on ALL measurements: "500g / 1.1 lb", "1 cup / 240ml", "400°F / 200°C"
+- Each step needs an "ingredients" array with EXACT strings from main ingredients
+- Include any handwritten tips or notes in the "tips" array
+- ${langInstr[targetLanguage] || langInstr.en}`
     });
     
     const response = await anthropic.messages.create({

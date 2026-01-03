@@ -826,6 +826,84 @@ app.post('/api/recipe/clean-youtube', async (req, res) => {
 });
 
 // =============================================================================
+// RECIPE TRANSLATION (Paid users only)
+// =============================================================================
+app.post('/api/recipe/translate', async (req, res) => {
+  const { recipe, targetLanguage } = req.body;
+  const token = req.headers['authorization']?.replace('Bearer ', '');
+  
+  try {
+    const session = await validateSession(token);
+    
+    // Check if user is paid
+    if (!session || !['basic', 'pro'].includes(session.subscription)) {
+      return res.status(402).json({ 
+        error: 'upgrade_required', 
+        message: 'Upgrade to translate recipes into any language' 
+      });
+    }
+    
+    const langNames = {
+      en: 'English',
+      es: 'Spanish (Español)',
+      fr: 'French (Français)',
+      pt: 'Portuguese (Português)',
+      zh: 'Simplified Chinese (简体中文)',
+      hi: 'Hindi (हिन्दी)',
+      ar: 'Arabic (العربية)',
+    };
+    
+    const targetLangName = langNames[targetLanguage] || 'English';
+    
+    console.log(`🌍 Translating recipe to ${targetLangName}`);
+    
+    const response = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001', // Haiku is cheap and fast for translation
+      max_tokens: 3000,
+      messages: [{
+        role: 'user',
+        content: `Translate this recipe to ${targetLangName}. Keep the same JSON structure, translate ALL text values (title, ingredients, instructions, tips). Keep JSON keys in English. Keep measurements with dual units. Return ONLY valid JSON, no explanation.
+
+RECIPE:
+${JSON.stringify(recipe)}
+
+IMPORTANT:
+- Translate title, all ingredients, all step instructions, all tips
+- Keep source, sourceUrl, author unchanged
+- Keep imageUrl unchanged
+- Keep numeric values (servings, etc) unchanged
+- Return complete valid JSON`
+      }]
+    });
+    
+    let text = response.content?.map(c => c.text || '').join('') || '';
+    text = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+    const match = text.match(/\{[\s\S]*\}/);
+    
+    if (!match) {
+      throw new Error('No valid JSON in response');
+    }
+    
+    const translatedRecipe = JSON.parse(match[0]);
+    
+    // Preserve fields that shouldn't change
+    translatedRecipe.source = recipe.source;
+    translatedRecipe.sourceUrl = recipe.sourceUrl;
+    translatedRecipe.imageUrl = recipe.imageUrl;
+    
+    // Track minimal cost (~$0.01)
+    trackSpending(0.01);
+    
+    console.log(`✅ Recipe translated to ${targetLangName}`);
+    res.json({ recipe: translatedRecipe });
+    
+  } catch (err) {
+    console.error('Translation error:', err);
+    res.status(500).json({ error: 'Failed to translate recipe' });
+  }
+});
+
+// =============================================================================
 // SAVED RECIPES
 // =============================================================================
 app.get('/api/recipes/saved', async (req, res) => {

@@ -3,6 +3,9 @@ import Stripe from "stripe";
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import pg from "pg";
+import crypto from "crypto";
+import bcrypt from "bcryptjs";
 
 dotenv.config();
 
@@ -10,1091 +13,976 @@ const app = express();
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
+// PostgreSQL connection
+const pool = new pg.Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+});
+
+// Test database connection
+pool.query('SELECT NOW()', (err) => {
+  if (err) console.error('❌ Database connection failed:', err.message);
+  else console.log('✅ Database connected');
+});
+
 // =============================================================================
-// COST PROTECTION CONFIGURATION
+// CONFIGURATION
 // =============================================================================
-const COST_PROTECTION = {
+const CONFIG = {
   COST_PER_URL_RECIPE: 0.03,
   COST_PER_PHOTO_RECIPE: 0.06,
   DAILY_SPENDING_LIMIT: 10,
   MONTHLY_SPENDING_LIMIT: 100,
+  INITIAL_FREE_RECIPES: 10,
   FREE_RECIPES_PER_MONTH: 3,
-  MAX_FREE_USERS_PER_DAY: 100,
-  ALERT_THRESHOLD: 0.7,
+  SESSION_DURATION_DAYS: 30,
+  BASIC_RECIPES_PER_MONTH: 20,
 };
 
+// In-memory spending tracker (resets on deploy, but that's OK for cost protection)
 const spendingTracker = {
-  today: { date: new Date().toDateString(), amount: 0, freeRecipes: 0, newFreeUsers: 0 },
+  today: { date: new Date().toDateString(), amount: 0 },
   month: { month: new Date().toISOString().slice(0, 7), amount: 0 },
   paused: false,
-  pauseReason: null,
 };
 
-function checkAndResetDaily() {
+function checkSpendingLimits() {
   const today = new Date().toDateString();
   if (spendingTracker.today.date !== today) {
-    console.log(`📊 Yesterday's spending: $${spendingTracker.today.amount.toFixed(2)} | Free recipes: ${spendingTracker.today.freeRecipes}`);
-    spendingTracker.today = { date: today, amount: 0, freeRecipes: 0, newFreeUsers: 0 };
-    if (spendingTracker.pauseReason === 'daily_limit') {
-      spendingTracker.paused = false;
-      spendingTracker.pauseReason = null;
-    }
+    spendingTracker.today = { date: today, amount: 0 };
   }
   const currentMonth = new Date().toISOString().slice(0, 7);
   if (spendingTracker.month.month !== currentMonth) {
     spendingTracker.month = { month: currentMonth, amount: 0 };
-    if (spendingTracker.pauseReason === 'monthly_limit') {
-      spendingTracker.paused = false;
-      spendingTracker.pauseReason = null;
-    }
+  }
+  
+  if (spendingTracker.today.amount >= CONFIG.DAILY_SPENDING_LIMIT ||
+      spendingTracker.month.amount >= CONFIG.MONTHLY_SPENDING_LIMIT) {
+    spendingTracker.paused = true;
   }
 }
 
-function trackSpending(amount, isFreeUser) {
-  checkAndResetDaily();
+function trackSpending(amount) {
   spendingTracker.today.amount += amount;
   spendingTracker.month.amount += amount;
-  if (isFreeUser) spendingTracker.today.freeRecipes++;
-  
-  if (spendingTracker.today.amount >= COST_PROTECTION.DAILY_SPENDING_LIMIT) {
-    spendingTracker.paused = true;
-    spendingTracker.pauseReason = 'daily_limit';
-  }
-  if (spendingTracker.month.amount >= COST_PROTECTION.MONTHLY_SPENDING_LIMIT) {
-    spendingTracker.paused = true;
-    spendingTracker.pauseReason = 'monthly_limit';
-  }
-}
-
-function canFreeUserProceed() {
-  checkAndResetDaily();
-  if (spendingTracker.paused) return { allowed: false, reason: spendingTracker.pauseReason };
-  if (spendingTracker.today.newFreeUsers >= COST_PROTECTION.MAX_FREE_USERS_PER_DAY) {
-    return { allowed: false, reason: 'max_free_users' };
-  }
-  return { allowed: true };
-}
-
-// =============================================================================
-// DATABASE (Use PostgreSQL in production)
-// =============================================================================
-const users = new Map();
-const savedRecipes = new Map();
-
-function getUser(email) {
-  if (!users.has(email)) {
-    const freeCheck = canFreeUserProceed();
-    if (!freeCheck.allowed && !email.startsWith('anon_')) return null;
-    
-    users.set(email, {
-      email,
-      recipesUsedThisMonth: 0,
-      monthStarted: new Date().toISOString().slice(0, 7),
-      subscription: null,
-      stripeCustomerId: null,
-    });
-    if (!email.startsWith('anon_')) spendingTracker.today.newFreeUsers++;
-  }
-  
-  const user = users.get(email);
-  const currentMonth = new Date().toISOString().slice(0, 7);
-  if (user.monthStarted !== currentMonth) {
-    user.recipesUsedThisMonth = 0;
-    user.monthStarted = currentMonth;
-  }
-  return user;
-}
-
-function canCleanRecipe(user) {
-  if (user.subscription === 'unlimited') return { allowed: true };
-  if (user.subscription === 'basic') return { allowed: user.recipesUsedThisMonth < 30 };
-  
-  const freeCheck = canFreeUserProceed();
-  if (!freeCheck.allowed) return { allowed: false, reason: freeCheck.reason };
-  return { allowed: user.recipesUsedThisMonth < COST_PROTECTION.FREE_RECIPES_PER_MONTH };
-}
-
-function getRemainingRecipes(user) {
-  if (user.subscription === 'unlimited') return Infinity;
-  const limit = user.subscription === 'basic' ? 30 : COST_PROTECTION.FREE_RECIPES_PER_MONTH;
-  return Math.max(0, limit - user.recipesUsedThisMonth);
+  checkSpendingLimits();
 }
 
 // =============================================================================
 // MIDDLEWARE
 // =============================================================================
 app.use(cors({ 
-  origin: function(origin, callback) {
-    // Allow requests with no origin (mobile apps, curl, etc)
-    if (!origin) return callback(null, true);
-    // Allow any origin for now (you can restrict this later)
-    return callback(null, true);
-  },
+  origin: true,
   credentials: true 
 }));
 app.use(express.json({ limit: '50mb' }));
 
 // =============================================================================
+// AUTH HELPERS
+// =============================================================================
+function generateToken() {
+  return crypto.randomBytes(32).toString('hex');
+}
+
+async function createSession(userId) {
+  const token = generateToken();
+  const expiresAt = new Date(Date.now() + CONFIG.SESSION_DURATION_DAYS * 24 * 60 * 60 * 1000);
+  await pool.query(
+    'INSERT INTO sessions (user_id, token, expires_at) VALUES ($1, $2, $3)',
+    [userId, token, expiresAt]
+  );
+  return { token, expiresAt };
+}
+
+async function validateSession(token) {
+  if (!token) return null;
+  const result = await pool.query(
+    `SELECT s.*, u.* FROM sessions s 
+     JOIN users u ON s.user_id = u.id 
+     WHERE s.token = $1 AND s.expires_at > NOW()`,
+    [token]
+  );
+  return result.rows[0] || null;
+}
+
+async function getUserByEmail(email) {
+  const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+  return result.rows[0] || null;
+}
+
+async function getUserByGoogleId(googleId) {
+  const result = await pool.query('SELECT * FROM users WHERE google_id = $1', [googleId]);
+  return result.rows[0] || null;
+}
+
+async function createUser({ email, passwordHash, googleId }) {
+  const result = await pool.query(
+    `INSERT INTO users (email, password_hash, google_id) 
+     VALUES ($1, $2, $3) 
+     RETURNING *`,
+    [email, passwordHash, googleId]
+  );
+  return result.rows[0];
+}
+
+async function resetMonthlyUsageIfNeeded(user) {
+  const currentMonth = new Date().toISOString().slice(0, 7);
+  if (user.month_started !== currentMonth) {
+    await pool.query(
+      'UPDATE users SET recipes_used_this_month = 0, month_started = $1 WHERE id = $2',
+      [currentMonth, user.id]
+    );
+    user.recipes_used_this_month = 0;
+    user.month_started = currentMonth;
+  }
+  return user;
+}
+
+// =============================================================================
+// ANONYMOUS USAGE TRACKING
+// =============================================================================
+async function getAnonymousUsage(fingerprint, ip) {
+  let result = await pool.query(
+    'SELECT * FROM anonymous_usage WHERE fingerprint = $1',
+    [fingerprint]
+  );
+  
+  if (!result.rows[0]) {
+    result = await pool.query(
+      `INSERT INTO anonymous_usage (fingerprint, ip_address, recipes_used) 
+       VALUES ($1, $2, 0) 
+       RETURNING *`,
+      [fingerprint, ip]
+    );
+  } else {
+    await pool.query(
+      'UPDATE anonymous_usage SET last_seen = NOW(), ip_address = $2 WHERE fingerprint = $1',
+      [fingerprint, ip]
+    );
+  }
+  
+  return result.rows[0];
+}
+
+async function incrementAnonymousUsage(fingerprint) {
+  await pool.query(
+    'UPDATE anonymous_usage SET recipes_used = recipes_used + 1 WHERE fingerprint = $1',
+    [fingerprint]
+  );
+}
+
+// =============================================================================
+// RECIPE LIMITS
+// =============================================================================
+async function canCleanRecipe(user, fingerprint, ip) {
+  checkSpendingLimits();
+  if (spendingTracker.paused) {
+    return { allowed: false, reason: 'system_limit' };
+  }
+  
+  // Logged in user
+  if (user) {
+    await resetMonthlyUsageIfNeeded(user);
+    
+    if (user.subscription === 'pro') return { allowed: true };
+    if (user.subscription === 'basic') {
+      return { 
+        allowed: user.recipes_used_this_month < CONFIG.BASIC_RECIPES_PER_MONTH,
+        remaining: CONFIG.BASIC_RECIPES_PER_MONTH - user.recipes_used_this_month
+      };
+    }
+    // Free signed-up user
+    return { 
+      allowed: user.recipes_used_this_month < CONFIG.FREE_RECIPES_PER_MONTH,
+      remaining: CONFIG.FREE_RECIPES_PER_MONTH - user.recipes_used_this_month,
+      upgrade: user.recipes_used_this_month >= CONFIG.FREE_RECIPES_PER_MONTH
+    };
+  }
+  
+  // Anonymous user
+  if (fingerprint) {
+    const usage = await getAnonymousUsage(fingerprint, ip);
+    if (usage.recipes_used < CONFIG.INITIAL_FREE_RECIPES) {
+      return { 
+        allowed: true, 
+        remaining: CONFIG.INITIAL_FREE_RECIPES - usage.recipes_used,
+        isAnonymous: true
+      };
+    }
+    return { 
+      allowed: false, 
+      reason: 'initial_limit', 
+      requiresSignup: true,
+      message: "You've used your 10 free recipes! Sign up free to get 3 more each month."
+    };
+  }
+  
+  return { allowed: false, reason: 'no_tracking' };
+}
+
+async function incrementUserUsage(user) {
+  await pool.query(
+    `UPDATE users SET 
+     recipes_used_this_month = recipes_used_this_month + 1,
+     total_recipes_ever = total_recipes_ever + 1
+     WHERE id = $1`,
+    [user.id]
+  );
+}
+
+function getRemainingRecipes(user) {
+  if (!user) return 0;
+  if (user.subscription === 'pro') return Infinity;
+  if (user.subscription === 'basic') {
+    return Math.max(0, CONFIG.BASIC_RECIPES_PER_MONTH - user.recipes_used_this_month);
+  }
+  return Math.max(0, CONFIG.FREE_RECIPES_PER_MONTH - user.recipes_used_this_month);
+}
+
+// =============================================================================
 // STATUS
 // =============================================================================
 app.get('/api/status', (req, res) => {
-  checkAndResetDaily();
+  checkSpendingLimits();
   res.json({
     status: spendingTracker.paused ? 'limited' : 'operational',
-    pauseReason: spendingTracker.pauseReason,
   });
 });
 
 // =============================================================================
-// AUTH
+// AUTH ENDPOINTS
 // =============================================================================
 app.post('/api/auth/register', async (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
-  if (users.has(email)) return res.status(400).json({ error: 'Account already exists' });
-  
-  const user = getUser(email);
-  if (!user) {
-    return res.status(503).json({ 
-      error: 'Free signups temporarily paused',
-      upgrade: true,
-      message: 'High demand! Upgrade for instant access.',
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password required' });
+    }
+    
+    const existing = await getUserByEmail(email);
+    if (existing) {
+      return res.status(400).json({ error: 'Account already exists' });
+    }
+    
+    const passwordHash = await bcrypt.hash(password, 10);
+    const user = await createUser({ email, passwordHash, googleId: null });
+    const session = await createSession(user.id);
+    
+    res.json({ 
+      user: { 
+        id: user.id,
+        email: user.email, 
+        subscription: user.subscription, 
+        recipesRemaining: CONFIG.FREE_RECIPES_PER_MONTH 
+      },
+      token: session.token,
+      expiresAt: session.expiresAt
     });
+  } catch (err) {
+    console.error('Register error:', err);
+    res.status(500).json({ error: 'Registration failed' });
   }
-  user.password = password;
-  res.json({ user: { email: user.email, subscription: user.subscription, recipesRemaining: getRemainingRecipes(user) } });
 });
 
 app.post('/api/auth/login', async (req, res) => {
-  const { email, password } = req.body;
-  if (!users.has(email)) return res.status(401).json({ error: 'Account not found' });
-  const user = users.get(email);
-  if (user.password !== password) return res.status(401).json({ error: 'Incorrect password' });
-  res.json({ user: { email: user.email, subscription: user.subscription, recipesRemaining: getRemainingRecipes(user) } });
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password required' });
+    }
+    
+    const user = await getUserByEmail(email);
+    if (!user || !user.password_hash) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+    const valid = await bcrypt.compare(password, user.password_hash);
+    if (!valid) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+    await resetMonthlyUsageIfNeeded(user);
+    const session = await createSession(user.id);
+    
+    res.json({ 
+      user: { 
+        id: user.id,
+        email: user.email, 
+        subscription: user.subscription, 
+        recipesRemaining: getRemainingRecipes(user)
+      },
+      token: session.token,
+      expiresAt: session.expiresAt
+    });
+  } catch (err) {
+    console.error('Login error:', err);
+    res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+app.post('/api/auth/google', async (req, res) => {
+  try {
+    const { credential } = req.body;
+    
+    // Decode the JWT from Google (in production, verify signature!)
+    const payload = JSON.parse(Buffer.from(credential.split('.')[1], 'base64').toString());
+    const { sub: googleId, email, name } = payload;
+    
+    let user = await getUserByGoogleId(googleId);
+    
+    if (!user) {
+      // Check if email exists (user signed up with password before)
+      const existingByEmail = await getUserByEmail(email);
+      if (existingByEmail) {
+        // Link Google account to existing user
+        await pool.query('UPDATE users SET google_id = $1 WHERE id = $2', [googleId, existingByEmail.id]);
+        user = existingByEmail;
+        user.google_id = googleId;
+      } else {
+        // Create new user
+        user = await createUser({ email, passwordHash: null, googleId });
+      }
+    }
+    
+    await resetMonthlyUsageIfNeeded(user);
+    const session = await createSession(user.id);
+    
+    res.json({ 
+      user: { 
+        id: user.id,
+        email: user.email, 
+        subscription: user.subscription, 
+        recipesRemaining: getRemainingRecipes(user)
+      },
+      token: session.token,
+      expiresAt: session.expiresAt
+    });
+  } catch (err) {
+    console.error('Google auth error:', err);
+    res.status(500).json({ error: 'Google sign-in failed' });
+  }
 });
 
 app.get('/api/auth/me', async (req, res) => {
-  const email = req.headers['x-user-email'];
-  if (!email || !users.has(email)) return res.status(401).json({ error: 'Not authenticated' });
-  const user = getUser(email);
-  res.json({ user: { email: user.email, subscription: user.subscription, recipesRemaining: getRemainingRecipes(user) } });
+  try {
+    const token = req.headers['authorization']?.replace('Bearer ', '');
+    const session = await validateSession(token);
+    
+    if (!session) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+    
+    const user = await resetMonthlyUsageIfNeeded(session);
+    
+    res.json({ 
+      user: { 
+        id: user.id,
+        email: user.email, 
+        subscription: user.subscription, 
+        recipesRemaining: getRemainingRecipes(user)
+      }
+    });
+  } catch (err) {
+    console.error('Auth check error:', err);
+    res.status(500).json({ error: 'Auth check failed' });
+  }
+});
+
+app.post('/api/auth/logout', async (req, res) => {
+  try {
+    const token = req.headers['authorization']?.replace('Bearer ', '');
+    if (token) {
+      await pool.query('DELETE FROM sessions WHERE token = $1', [token]);
+    }
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Logout failed' });
+  }
 });
 
 // =============================================================================
-// HELPER: Validate and fix recipe output
-// =============================================================================
-function validateAndFixRecipe(recipe) {
-  const issues = [];
-  
-  // Check required fields
-  if (!recipe.title) recipe.title = 'Recipe';
-  if (!recipe.servings) recipe.servings = 4;
-  if (!recipe.ingredients || !Array.isArray(recipe.ingredients)) recipe.ingredients = [];
-  if (!recipe.steps || !Array.isArray(recipe.steps)) recipe.steps = [];
-  
-  // Check for steps that are too long (likely mashed together)
-  const MAX_STEP_LENGTH = 400;
-  const needsStepSplitting = recipe.steps.some(step => {
-    const text = typeof step === 'string' ? step : step.instruction;
-    return text && text.length > MAX_STEP_LENGTH;
-  });
-  
-  if (needsStepSplitting) {
-    issues.push('steps_too_long');
-  }
-  
-  // Check if too few steps for number of ingredients (likely mashed)
-  if (recipe.ingredients.length > 5 && recipe.steps.length < 3) {
-    issues.push('too_few_steps');
-  }
-  
-  // Check if steps are missing ingredients arrays
-  recipe.steps = recipe.steps.map(step => {
-    if (typeof step === 'string') {
-      return { instruction: step, ingredients: [] };
-    }
-    if (!step.ingredients) step.ingredients = [];
-    return step;
-  });
-  
-  // Check for empty or very short instructions
-  recipe.steps = recipe.steps.filter(step => {
-    const text = step.instruction || '';
-    return text.trim().length > 10;
-  });
-  
-  return { recipe, issues };
-}
-
-// =============================================================================
-// HELPER: Use Claude to fix recipe issues
-// =============================================================================
-async function fixRecipeIssues(recipe, issues, targetLanguage = 'en') {
-  if (issues.length === 0) return recipe;
-  
-  console.log('🔧 Fixing recipe issues:', issues.join(', '));
-  
-  const languageInstructions = {
-    en: 'Output everything in English.',
-    es: 'Output everything in Spanish (Español).',
-    fr: 'Output everything in French (Français).',
-    pt: 'Output everything in Portuguese (Português).',
-    zh: 'Output everything in Simplified Chinese (简体中文).',
-    hi: 'Output everything in Hindi (हिन्दी).',
-    ar: 'Output everything in Arabic (العربية). Keep JSON keys in English, translate values only.',
-  };
-  
-  try {
-    const response = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 3000,
-      messages: [{
-        role: 'user',
-        content: `Fix this recipe JSON. Issues found: ${issues.join(', ')}
-
-CURRENT RECIPE:
-${JSON.stringify(recipe, null, 2)}
-
-FIXES NEEDED:
-${issues.includes('steps_too_long') ? '- Split long steps into individual steps (one action per step, max 300 chars each)' : ''}
-${issues.includes('too_few_steps') ? '- Break down the cooking process into more detailed individual steps' : ''}
-
-RULES:
-- Each step should be ONE clear action (max 300 characters)
-- Each step needs an "ingredients" array with EXACT strings from the main ingredients array used in that step
-- Dual units on all measurements: "500g / 1.1 lb", "1 cup / 240ml", "400°F / 200°C"
-- ${languageInstructions[targetLanguage] || languageInstructions.en}
-- Return ONLY valid JSON, no explanation`
-      }]
-    });
-    
-    let text = response.content?.map(c => c.text || '').join('') || '';
-    text = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) return recipe;
-    
-    const fixed = JSON.parse(jsonMatch[0]);
-    console.log('✅ Recipe fixed:', fixed.steps?.length, 'steps now');
-    return fixed;
-  } catch (err) {
-    console.error('Fix error:', err);
-    return recipe;
-  }
-}
-
-// =============================================================================
-// HELPER: Fetch webpage content
+// RECIPE HELPERS (same as before)
 // =============================================================================
 async function fetchWebpage(url) {
   try {
     const response = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-      }
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
     });
-    const html = await response.text();
-    return html;
+    return await response.text();
   } catch (err) {
-    console.error('Failed to fetch webpage:', err);
+    console.error('Fetch error:', err);
     return null;
   }
 }
 
-// =============================================================================
-// HELPER: Extract JSON-LD Recipe Schema (FAST PATH - no API call needed)
-// =============================================================================
 function extractRecipeSchema(html) {
   try {
-    // Find all JSON-LD scripts
     const jsonLdRegex = /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
     let match;
-    
     while ((match = jsonLdRegex.exec(html)) !== null) {
       try {
         let data = JSON.parse(match[1]);
-        
-        // Handle @graph arrays (common in WordPress/Yoast)
         if (data['@graph']) {
           data = data['@graph'].find(item => item['@type'] === 'Recipe' || item['@type']?.includes('Recipe'));
         }
-        
-        // Handle arrays
         if (Array.isArray(data)) {
           data = data.find(item => item['@type'] === 'Recipe' || item['@type']?.includes('Recipe'));
         }
-        
-        // Check if this is a Recipe
         if (data && (data['@type'] === 'Recipe' || data['@type']?.includes('Recipe'))) {
-          console.log('✅ Found JSON-LD recipe schema!');
           return data;
         }
-      } catch (e) {
-        // Invalid JSON, continue searching
-      }
+      } catch (e) {}
     }
     return null;
   } catch (err) {
-    console.error('Schema extraction error:', err);
     return null;
   }
 }
 
-// =============================================================================
-// HELPER: Convert JSON-LD schema to our recipe format
-// =============================================================================
 function convertSchemaToRecipe(schema, sourceUrl) {
-  // Parse ingredients
-  const ingredients = (schema.recipeIngredient || []).map(ing => {
-    // Already a string, just return it (we'll let Claude add dual units if needed later)
-    return ing;
-  });
-  
-  // Parse instructions
+  const ingredients = schema.recipeIngredient || [];
   let steps = [];
   const instructions = schema.recipeInstructions || [];
   
   if (typeof instructions === 'string') {
-    // Single string - split by periods or newlines
     steps = instructions.split(/\.|\n/).filter(s => s.trim()).map(s => ({
-      instruction: s.trim() + '.',
-      ingredients: []
+      instruction: s.trim() + '.', ingredients: []
     }));
   } else if (Array.isArray(instructions)) {
     steps = instructions.map(step => {
-      if (typeof step === 'string') {
-        return { instruction: step, ingredients: [] };
-      } else if (step['@type'] === 'HowToStep') {
-        return { instruction: step.text || step.name || '', ingredients: [] };
-      } else if (step['@type'] === 'HowToSection') {
-        // Handle sections with itemListElement
-        const sectionSteps = (step.itemListElement || []).map(item => ({
-          instruction: item.text || item.name || '',
-          ingredients: []
-        }));
-        return sectionSteps;
+      if (typeof step === 'string') return { instruction: step, ingredients: [] };
+      if (step['@type'] === 'HowToStep') return { instruction: step.text || step.name || '', ingredients: [] };
+      if (step['@type'] === 'HowToSection') {
+        return (step.itemListElement || []).map(item => ({ instruction: item.text || item.name || '', ingredients: [] }));
       }
       return { instruction: String(step), ingredients: [] };
     }).flat();
   }
   
-  // Parse times
-  const parseDuration = (duration) => {
-    if (!duration) return null;
-    const match = duration.match(/PT(?:(\d+)H)?(?:(\d+)M)?/);
-    if (!match) return duration;
-    const hours = parseInt(match[1] || 0);
-    const mins = parseInt(match[2] || 0);
-    if (hours && mins) return `${hours}h ${mins}min`;
-    if (hours) return `${hours}h`;
-    if (mins) return `${mins} min`;
+  const parseDuration = (d) => {
+    if (!d) return null;
+    const m = d.match(/PT(?:(\d+)H)?(?:(\d+)M)?/);
+    if (!m) return d;
+    const h = parseInt(m[1] || 0), min = parseInt(m[2] || 0);
+    if (h && min) return `${h}h ${min}min`;
+    if (h) return `${h}h`;
+    if (min) return `${min} min`;
     return null;
   };
   
-  // Get image URL
-  let imageUrl = null;
-  if (schema.image) {
-    if (typeof schema.image === 'string') imageUrl = schema.image;
-    else if (Array.isArray(schema.image)) imageUrl = schema.image[0]?.url || schema.image[0];
-    else if (schema.image.url) imageUrl = schema.image.url;
-  }
-  
-  // Get author
-  let author = null;
-  if (schema.author) {
-    if (typeof schema.author === 'string') author = schema.author;
-    else if (schema.author.name) author = schema.author.name;
-    else if (Array.isArray(schema.author)) author = schema.author[0]?.name || schema.author[0];
-  }
+  let imageUrl = typeof schema.image === 'string' ? schema.image : schema.image?.url || schema.image?.[0]?.url || schema.image?.[0] || null;
+  let author = typeof schema.author === 'string' ? schema.author : schema.author?.name || schema.author?.[0]?.name || null;
   
   return {
     title: schema.name || 'Recipe',
     servings: parseInt(schema.recipeYield?.[0] || schema.recipeYield) || 4,
     prepTime: parseDuration(schema.prepTime),
     cookTime: parseDuration(schema.cookTime),
-    imageUrl,
-    ingredients,
-    steps,
-    tips: [],
+    imageUrl, ingredients, steps, tips: [],
     source: new URL(sourceUrl).hostname.replace('www.', ''),
-    sourceUrl,
-    author,
-    _needsDualUnits: true, // Flag to indicate we need Claude to add dual units
+    sourceUrl, author, _needsDualUnits: true,
   };
 }
 
-// =============================================================================
-// HELPER: Use Claude to enhance recipe with dual units (lightweight call)
-// =============================================================================
+function validateAndFixRecipe(recipe) {
+  const issues = [];
+  if (!recipe.title) recipe.title = 'Recipe';
+  if (!recipe.servings) recipe.servings = 4;
+  if (!recipe.ingredients || !Array.isArray(recipe.ingredients)) recipe.ingredients = [];
+  if (!recipe.steps || !Array.isArray(recipe.steps)) recipe.steps = [];
+  
+  const MAX_STEP_LENGTH = 400;
+  if (recipe.steps.some(s => (typeof s === 'string' ? s : s.instruction)?.length > MAX_STEP_LENGTH)) {
+    issues.push('steps_too_long');
+  }
+  if (recipe.ingredients.length > 5 && recipe.steps.length < 3) {
+    issues.push('too_few_steps');
+  }
+  
+  recipe.steps = recipe.steps.map(s => typeof s === 'string' ? { instruction: s, ingredients: [] } : { ...s, ingredients: s.ingredients || [] });
+  recipe.steps = recipe.steps.filter(s => s.instruction?.trim().length > 10);
+  
+  return { recipe, issues };
+}
+
 async function enhanceRecipeWithDualUnits(recipe, targetLanguage = 'en') {
+  const langInstr = {
+    en: 'Output in English.', es: 'Output in Spanish.', fr: 'Output in French.',
+    pt: 'Output in Portuguese.', zh: 'Output in Simplified Chinese.',
+    hi: 'Output in Hindi.', ar: 'Output in Arabic. Keep JSON keys in English.',
+  };
+  
   try {
-    console.log('🔄 Enhancing recipe with dual units...');
-    
-    const languageInstructions = {
-      en: 'Output everything in English.',
-      es: 'Output everything in Spanish (Español).',
-      fr: 'Output everything in French (Français).',
-      pt: 'Output everything in Portuguese (Português).',
-      zh: 'Output everything in Simplified Chinese (简体中文).',
-      hi: 'Output everything in Hindi (हिन्दी).',
-      ar: 'Output everything in Arabic (العربية). Note: Keep the JSON structure in English keys, only translate the values.',
-    };
-    
     const response = await anthropic.messages.create({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 2500,
       messages: [{
         role: 'user',
-        content: `Convert this recipe to have dual units and translate if needed. Return ONLY valid JSON, no explanation.
-
-INPUT:
-${JSON.stringify(recipe, null, 2)}
-
-RULES:
-- Add dual units to ALL measurements: "500g / 1.1 lb", "1 cup / 240ml", "400°F / 200°C"
-- Keep everything else exactly the same structure
-- For each step, add an "ingredients" array with the EXACT ingredient strings (with dual units) used in that step
-- ${languageInstructions[targetLanguage] || languageInstructions.en}
-- Return the complete recipe JSON with same field names (title, servings, ingredients, steps, etc.)`
+        content: `Convert this recipe to have dual units. Return ONLY valid JSON.\n\nINPUT:\n${JSON.stringify(recipe)}\n\nRULES:\n- Dual units: "500g / 1.1 lb", "1 cup / 240ml", "400°F / 200°C"\n- Each step needs "ingredients" array with EXACT strings from main ingredients\n- ${langInstr[targetLanguage] || langInstr.en}\n- Return complete recipe JSON`
       }]
     });
     
     let text = response.content?.map(c => c.text || '').join('') || '';
     text = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) return recipe;
+    const match = text.match(/\{[\s\S]*\}/);
+    if (!match) return recipe;
     
-    const enhanced = JSON.parse(jsonMatch[0]);
+    const enhanced = JSON.parse(match[0]);
     delete enhanced._needsDualUnits;
     return enhanced;
   } catch (err) {
-    console.error('Enhancement error:', err);
-    delete recipe._needsDualUnits;
-    return recipe; // Return original if enhancement fails
+    console.error('Enhance error:', err);
+    return recipe;
   }
 }
 
-// =============================================================================
-// HELPER: Strip HTML for fallback
-// =============================================================================
-function stripHtml(html) {
-  return html
-    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
-    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 15000);
-}
-
-// =============================================================================
-// RECIPES
-// =============================================================================
-app.post('/api/recipe/clean-url', async (req, res) => {
-  const { url, language } = req.body;
-  const targetLanguage = ['en', 'es', 'fr', 'pt', 'zh', 'hi', 'ar'].includes(language) ? language : 'en';
-  const email = req.headers['x-user-email'];
+async function fixRecipeIssues(recipe, issues, targetLanguage = 'en') {
+  if (!issues.length) return recipe;
   
-  console.log(`📥 Recipe request for: ${url} (language: ${targetLanguage})`);
-  
-  const user = email ? getUser(email) : getUser(`anon_${req.ip}`);
-  if (!user) return res.status(503).json({ error: 'Service limited', upgrade: true, message: 'Upgrade for instant access!' });
-  
-  const canClean = canCleanRecipe(user);
-  if (!canClean.allowed) {
-    return res.status(402).json({ error: 'Limit reached', upgrade: true, message: 'Upgrade to continue!' });
-  }
-  
-  const isFreeUser = !user.subscription;
+  const langInstr = {
+    en: 'Output in English.', es: 'Output in Spanish.', fr: 'Output in French.',
+    pt: 'Output in Portuguese.', zh: 'Output in Simplified Chinese.',
+    hi: 'Output in Hindi.', ar: 'Output in Arabic. Keep JSON keys in English.',
+  };
   
   try {
-    // Fetch the webpage content first
-    console.log('🌐 Fetching webpage...');
-    const html = await fetchWebpage(url);
-    
-    if (!html) {
-      return res.status(400).json({ error: 'Could not fetch recipe page. Please check the URL.' });
-    }
-    
-    // FAST PATH: Try to extract JSON-LD schema (most recipe sites have this)
-    const schema = extractRecipeSchema(html);
-    
-    if (schema) {
-      console.log('⚡ Using fast path (JSON-LD schema found)');
-      let recipe = convertSchemaToRecipe(schema, url);
-      
-      // Validate and check for issues
-      const { recipe: validatedRecipe, issues } = validateAndFixRecipe(recipe);
-      recipe = validatedRecipe;
-      
-      // Fix any issues found
-      if (issues.length > 0) {
-        recipe = await fixRecipeIssues(recipe, issues, targetLanguage);
-      }
-      
-      // Quick enhancement with Haiku for dual units and translation
-      recipe = await enhanceRecipeWithDualUnits(recipe, targetLanguage);
-      
-      // Final validation
-      const finalCheck = validateAndFixRecipe(recipe);
-      recipe = finalCheck.recipe;
-      
-      user.recipesUsedThisMonth++;
-      trackSpending(COST_PROTECTION.COST_PER_URL_RECIPE * 0.5, isFreeUser); // Slightly more with fixes
-      
-      console.log(`✅ Recipe cleaned (fast): ${recipe.title} - ${recipe.steps?.length} steps`);
-      return res.json({ recipe, recipesRemaining: getRemainingRecipes(user) });
-    }
-    
-    // SLOW PATH: Full Claude extraction (fallback for sites without schema)
-    console.log('🐢 Using slow path (no schema, full extraction)');
-    const pageContent = stripHtml(html);
-    
-    const languageInstructions = {
-      en: 'Output everything in English.',
-      es: 'Output everything in Spanish (Español).',
-      fr: 'Output everything in French (Français).',
-      pt: 'Output everything in Portuguese (Português).',
-      zh: 'Output everything in Simplified Chinese (简体中文).',
-      hi: 'Output everything in Hindi (हिन्दी).',
-      ar: 'Output everything in Arabic (العربية). Keep JSON keys in English, translate values only.',
-    };
-    
-    console.log('🤖 Calling Claude API...');
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 2500,
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 3000,
       messages: [{
         role: 'user',
-        content: `Extract the recipe from this webpage content and return a cleaned version.
-
-WEBPAGE CONTENT:
-${pageContent}
-
-RESPOND WITH ONLY VALID JSON (no markdown, no backticks, no explanation):
-{"title":"Recipe name","servings":4,"prepTime":"15 min","cookTime":"30 min","imageUrl":null,"ingredients":["500g / 1.1 lb ingredient","2 tbsp / 30ml oil"],"steps":[{"instruction":"Step description here.","ingredients":["500g / 1.1 lb ingredient"]}],"tips":["optional tip"],"source":"Website name","sourceUrl":"${url}","author":"Author name or null"}
-
-CRITICAL RULES:
-- Every measurement MUST have dual units: "500g / 1.1 lb" or "1 cup / 240ml"
-- Temperatures in both: "400°F / 200°C"
-- Each step has "instruction" and "ingredients" array
-- IMPORTANT: The "ingredients" array in each step MUST copy-paste EXACT strings from the main "ingredients" array - same wording, same amounts, same units. Do not rephrase or abbreviate.
-- One clear action per step
-- Extract tips if mentioned
-- ${languageInstructions[targetLanguage] || languageInstructions.en}
-- Return ONLY the JSON, nothing else`
+        content: `Fix this recipe. Issues: ${issues.join(', ')}\n\nRECIPE:\n${JSON.stringify(recipe)}\n\nFIXES:\n${issues.includes('steps_too_long') ? '- Split long steps (max 300 chars each)' : ''}\n${issues.includes('too_few_steps') ? '- Break into more steps' : ''}\n\nRULES:\n- One action per step\n- Each step needs "ingredients" array\n- Dual units\n- ${langInstr[targetLanguage] || langInstr.en}\n- Return ONLY valid JSON`
       }]
     });
-
-    console.log('✅ Claude responded');
     
     let text = response.content?.map(c => c.text || '').join('') || '';
     text = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
-      console.error('No JSON found in response:', text.slice(0, 200));
-      throw new Error('No JSON found in response');
-    }
-    
-    let recipe = JSON.parse(jsonMatch[0]);
-    if (!recipe.sourceUrl) recipe.sourceUrl = url;
-    
-    // Validate and fix any issues
-    const { recipe: validatedRecipe, issues } = validateAndFixRecipe(recipe);
-    recipe = validatedRecipe;
-    
-    if (issues.length > 0) {
-      recipe = await fixRecipeIssues(recipe, issues, targetLanguage);
-    }
-    
-    user.recipesUsedThisMonth++;
-    trackSpending(COST_PROTECTION.COST_PER_URL_RECIPE, isFreeUser);
-    
-    console.log(`✅ Recipe cleaned: ${recipe.title} - ${recipe.steps?.length} steps`);
-    res.json({ recipe, recipesRemaining: getRemainingRecipes(user) });
+    const match = text.match(/\{[\s\S]*\}/);
+    return match ? JSON.parse(match[0]) : recipe;
   } catch (err) {
-    console.error('Recipe clean error:', err);
-    res.status(500).json({ error: 'Failed to clean recipe. Please try again.' });
+    console.error('Fix error:', err);
+    return recipe;
+  }
+}
+
+function stripHtml(html) {
+  return html.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+    .replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 15000);
+}
+
+// =============================================================================
+// RECIPE ENDPOINTS
+// =============================================================================
+app.post('/api/recipe/clean-url', async (req, res) => {
+  const { url, language, fingerprint } = req.body;
+  const targetLanguage = ['en', 'es', 'fr', 'pt', 'zh', 'hi', 'ar'].includes(language) ? language : 'en';
+  const token = req.headers['authorization']?.replace('Bearer ', '');
+  const ip = req.ip || req.headers['x-forwarded-for'];
+  
+  try {
+    const session = await validateSession(token);
+    const user = session ? await resetMonthlyUsageIfNeeded(session) : null;
+    
+    const canClean = await canCleanRecipe(user, fingerprint, ip);
+    if (!canClean.allowed) {
+      return res.status(402).json({ 
+        error: canClean.reason, 
+        requiresSignup: canClean.requiresSignup,
+        upgrade: canClean.upgrade,
+        message: canClean.message || 'Upgrade for more recipes!'
+      });
+    }
+    
+    console.log(`📥 Recipe request for: ${url}`);
+    const html = await fetchWebpage(url);
+    if (!html) return res.status(400).json({ error: 'Could not fetch recipe page.' });
+    
+    const schema = extractRecipeSchema(html);
+    let recipe;
+    
+    if (schema) {
+      console.log('⚡ Fast path');
+      recipe = convertSchemaToRecipe(schema, url);
+      const { recipe: validated, issues } = validateAndFixRecipe(recipe);
+      recipe = validated;
+      if (issues.length) recipe = await fixRecipeIssues(recipe, issues, targetLanguage);
+      recipe = await enhanceRecipeWithDualUnits(recipe, targetLanguage);
+      trackSpending(CONFIG.COST_PER_URL_RECIPE * 0.5);
+    } else {
+      console.log('🐢 Slow path');
+      const langInstr = { en: 'Output in English.', es: 'Output in Spanish.', fr: 'Output in French.', pt: 'Output in Portuguese.', zh: 'Output in Simplified Chinese.', hi: 'Output in Hindi.', ar: 'Output in Arabic.' };
+      
+      const response = await anthropic.messages.create({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 2500,
+        messages: [{
+          role: 'user',
+          content: `Extract recipe from this webpage. Return ONLY valid JSON:\n{"title":"","servings":4,"prepTime":"","cookTime":"","imageUrl":null,"ingredients":["500g / 1.1 lb item"],"steps":[{"instruction":"","ingredients":[]}],"tips":[],"source":"","sourceUrl":"${url}","author":null}\n\nRULES:\n- Dual units always\n- Each step has ingredients array with EXACT strings from main ingredients\n- ${langInstr[targetLanguage] || langInstr.en}\n\nWEBPAGE:\n${stripHtml(html)}`
+        }]
+      });
+      
+      let text = response.content?.map(c => c.text || '').join('') || '';
+      text = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+      const match = text.match(/\{[\s\S]*\}/);
+      if (!match) throw new Error('No JSON');
+      
+      recipe = JSON.parse(match[0]);
+      recipe.sourceUrl = url;
+      const { recipe: validated, issues } = validateAndFixRecipe(recipe);
+      recipe = validated;
+      if (issues.length) recipe = await fixRecipeIssues(recipe, issues, targetLanguage);
+      trackSpending(CONFIG.COST_PER_URL_RECIPE);
+    }
+    
+    // Track usage
+    if (user) {
+      await incrementUserUsage(user);
+    } else if (fingerprint) {
+      await incrementAnonymousUsage(fingerprint);
+    }
+    
+    const remaining = user ? getRemainingRecipes({ ...user, recipes_used_this_month: user.recipes_used_this_month + 1 }) 
+                          : Math.max(0, (canClean.remaining || 0) - 1);
+    
+    console.log(`✅ Recipe: ${recipe.title}`);
+    res.json({ recipe, recipesRemaining: remaining });
+  } catch (err) {
+    console.error('Recipe error:', err);
+    res.status(500).json({ error: 'Failed to clean recipe.' });
   }
 });
 
 app.post('/api/recipe/clean-photo', async (req, res) => {
-  const { photos, language } = req.body;
+  const { photos, language, fingerprint } = req.body;
   const targetLanguage = ['en', 'es', 'fr', 'pt', 'zh', 'hi', 'ar'].includes(language) ? language : 'en';
-  const email = req.headers['x-user-email'];
-  
-  console.log(`📷 Photo recipe request with ${photos?.length || 0} photos (language: ${targetLanguage})`);
-  
-  const user = email ? getUser(email) : getUser(`anon_${req.ip}`);
-  if (!user) return res.status(503).json({ error: 'Service limited', upgrade: true });
-  
-  const canClean = canCleanRecipe(user);
-  if (!canClean.allowed) return res.status(402).json({ error: 'Limit reached', upgrade: true });
-  
-  const isFreeUser = !user.subscription;
-  
-  const languageInstructions = {
-    en: 'Output everything in English.',
-    es: 'Output everything in Spanish (Español).',
-    fr: 'Output everything in French (Français).',
-    pt: 'Output everything in Portuguese (Português).',
-    zh: 'Output everything in Simplified Chinese (简体中文).',
-    hi: 'Output everything in Hindi (हिन्दी).',
-    ar: 'Output everything in Arabic (العربية). Keep JSON keys in English, translate values only.',
-  };
+  const token = req.headers['authorization']?.replace('Bearer ', '');
+  const ip = req.ip || req.headers['x-forwarded-for'];
   
   try {
-    // Compress images if too many - limit to 4 photos max
-    const photosToProcess = photos.slice(0, 4);
+    const session = await validateSession(token);
+    const user = session ? await resetMonthlyUsageIfNeeded(session) : null;
     
-    const content = photosToProcess.map(photo => {
-      const matches = photo.match(/^data:(.+);base64,(.+)$/);
-      return matches ? { type: 'image', source: { type: 'base64', media_type: matches[1], data: matches[2] } } : null;
+    const canClean = await canCleanRecipe(user, fingerprint, ip);
+    if (!canClean.allowed) {
+      return res.status(402).json({ 
+        error: canClean.reason, 
+        requiresSignup: canClean.requiresSignup,
+        upgrade: canClean.upgrade,
+        message: canClean.message || 'Upgrade for more recipes!'
+      });
+    }
+    
+    const langInstr = { en: 'Output in English.', es: 'Output in Spanish.', fr: 'Output in French.', pt: 'Output in Portuguese.', zh: 'Output in Simplified Chinese.', hi: 'Output in Hindi.', ar: 'Output in Arabic.' };
+    
+    const photosToProcess = photos.slice(0, 4);
+    const content = photosToProcess.map(p => {
+      const m = p.match(/^data:(.+);base64,(.+)$/);
+      return m ? { type: 'image', source: { type: 'base64', media_type: m[1], data: m[2] } } : null;
     }).filter(Boolean);
     
     content.push({
       type: 'text',
-      text: `Extract the recipe from these cookbook photos.
-
-RESPOND WITH ONLY VALID JSON (no markdown, no backticks):
-{"title":"Recipe name","servings":4,"prepTime":"15 min","cookTime":"30 min","imageUrl":null,"ingredients":["500g / 1.1 lb ingredient"],"steps":[{"instruction":"Step text","ingredients":["500g / 1.1 lb ingredient"]}],"tips":[],"source":"Cookbook name or 'Cookbook'","sourceUrl":null,"author":"Author or null"}
-
-CRITICAL RULES:
-- Dual units always: "500g / 1.1 lb", "1 cup / 240ml", "400°F / 200°C"
-- One action per step
-- IMPORTANT: The "ingredients" array in each step MUST copy-paste EXACT strings from the main "ingredients" array - same wording, same amounts, same units. Do not rephrase or abbreviate.
-- ${languageInstructions[targetLanguage] || languageInstructions.en}
-- Return ONLY the JSON`
+      text: `Extract recipe from photos. Return ONLY valid JSON:\n{"title":"","servings":4,"prepTime":"","cookTime":"","imageUrl":null,"ingredients":["500g / 1.1 lb item"],"steps":[{"instruction":"","ingredients":[]}],"tips":[],"source":"Cookbook","sourceUrl":null,"author":null}\n\nRULES:\n- Dual units\n- Each step has ingredients array\n- ${langInstr[targetLanguage] || langInstr.en}`
     });
-
-    console.log('🤖 Calling Claude API for photos...');
+    
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 4000,
       messages: [{ role: 'user', content }]
     });
-
+    
     let text = response.content?.map(c => c.text || '').join('') || '';
     text = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error('No JSON');
+    const match = text.match(/\{[\s\S]*\}/);
+    if (!match) throw new Error('No JSON');
     
-    let recipe = JSON.parse(jsonMatch[0]);
+    let recipe = JSON.parse(match[0]);
+    const { recipe: validated, issues } = validateAndFixRecipe(recipe);
+    recipe = validated;
+    if (issues.length) recipe = await fixRecipeIssues(recipe, issues, targetLanguage);
     
-    // Validate and fix any issues
-    const { recipe: validatedRecipe, issues } = validateAndFixRecipe(recipe);
-    recipe = validatedRecipe;
+    trackSpending(CONFIG.COST_PER_PHOTO_RECIPE);
     
-    if (issues.length > 0) {
-      recipe = await fixRecipeIssues(recipe, issues, targetLanguage);
-    }
+    if (user) await incrementUserUsage(user);
+    else if (fingerprint) await incrementAnonymousUsage(fingerprint);
     
-    user.recipesUsedThisMonth++;
-    trackSpending(COST_PROTECTION.COST_PER_PHOTO_RECIPE, isFreeUser);
+    const remaining = user ? getRemainingRecipes({ ...user, recipes_used_this_month: user.recipes_used_this_month + 1 }) 
+                          : Math.max(0, (canClean.remaining || 0) - 1);
     
-    console.log(`✅ Photo recipe cleaned: ${recipe.title} - ${recipe.steps?.length} steps`);
-    res.json({ recipe, recipesRemaining: getRemainingRecipes(user) });
+    res.json({ recipe, recipesRemaining: remaining });
   } catch (err) {
-    console.error('Photo clean error:', err);
-    res.status(500).json({ error: 'Failed to read recipe from photos' });
+    console.error('Photo error:', err);
+    res.status(500).json({ error: 'Failed to read recipe from photos.' });
   }
 });
 
-// =============================================================================
-// YOUTUBE RECIPE EXTRACTION
-// =============================================================================
-async function extractYoutubeVideoId(url) {
-  const patterns = [
-    /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([^&\n?#]+)/,
-    /youtube\.com\/shorts\/([^&\n?#]+)/,
-  ];
-  for (const pattern of patterns) {
-    const match = url.match(pattern);
-    if (match) return match[1];
-  }
-  return null;
-}
-
-async function getYoutubeTranscript(videoId) {
-  try {
-    // Try to get transcript from YouTube's timedtext API
-    // First, get the video page to find available captions
-    const videoPageResponse = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-      }
-    });
-    const html = await videoPageResponse.text();
-    
-    // Extract caption track URL from the page
-    const captionMatch = html.match(/"captions":\s*({[^}]+})/);
-    if (!captionMatch) {
-      // Try alternative method - look for timedtext in the page
-      const timedTextMatch = html.match(/timedtext[^"]*lang=([^&"]+)/);
-      if (timedTextMatch) {
-        const lang = timedTextMatch[1];
-        const transcriptUrl = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${lang}`;
-        const transcriptResponse = await fetch(transcriptUrl);
-        const transcriptXml = await transcriptResponse.text();
-        // Parse XML transcript
-        const textMatches = transcriptXml.matchAll(/<text[^>]*>([^<]+)<\/text>/g);
-        const segments = [];
-        for (const match of textMatches) {
-          segments.push(match[1].replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#39;/g, "'").replace(/&quot;/g, '"'));
-        }
-        if (segments.length > 0) {
-          return segments.join(' ');
-        }
-      }
-    }
-    
-    // Try using a transcript extraction service as fallback
-    // Look for playerCaptionsTracklistRenderer
-    const captionsListMatch = html.match(/playerCaptionsTracklistRenderer":\s*(\{[^}]+\})/);
-    if (captionsListMatch) {
-      try {
-        // Find baseUrl for captions
-        const baseUrlMatch = html.match(/"baseUrl":\s*"([^"]+timedtext[^"]+)"/);
-        if (baseUrlMatch) {
-          let captionUrl = baseUrlMatch[1].replace(/\\u0026/g, '&');
-          const captionResponse = await fetch(captionUrl);
-          const captionData = await captionResponse.text();
-          
-          // Parse the caption data (could be JSON or XML)
-          if (captionData.startsWith('{')) {
-            const json = JSON.parse(captionData);
-            if (json.events) {
-              return json.events
-                .filter(e => e.segs)
-                .map(e => e.segs.map(s => s.utf8).join(''))
-                .join(' ');
-            }
-          } else {
-            // XML format
-            const textMatches = captionData.matchAll(/<text[^>]*>([^<]+)<\/text>/g);
-            const segments = [];
-            for (const match of textMatches) {
-              segments.push(match[1]);
-            }
-            return segments.join(' ');
-          }
-        }
-      } catch (e) {
-        console.log('Caption extraction error:', e.message);
-      }
-    }
-    
-    // If no transcript available, try to get video description and title
-    const titleMatch = html.match(/<title>([^<]+)<\/title>/);
-    const descMatch = html.match(/"description":\s*\{"simpleText":\s*"([^"]+)"/);
-    
-    if (titleMatch || descMatch) {
-      return `Video Title: ${titleMatch ? titleMatch[1] : 'Unknown'}\n\nDescription: ${descMatch ? descMatch[1].replace(/\\n/g, '\n') : 'No description'}`;
-    }
-    
-    return null;
-  } catch (err) {
-    console.error('YouTube transcript error:', err);
-    return null;
-  }
-}
-
 app.post('/api/recipe/clean-youtube', async (req, res) => {
-  const { url, language } = req.body;
+  const { url, language, fingerprint } = req.body;
   const targetLanguage = ['en', 'es', 'fr', 'pt', 'zh', 'hi', 'ar'].includes(language) ? language : 'en';
-  const email = req.headers['x-user-email'];
-  
-  console.log(`🎬 YouTube recipe request for: ${url} (language: ${targetLanguage})`);
-  
-  const user = email ? getUser(email) : getUser(`anon_${req.ip}`);
-  if (!user) return res.status(503).json({ error: 'Service limited', upgrade: true, message: 'Upgrade for instant access!' });
-  
-  const canClean = canCleanRecipe(user);
-  if (!canClean.allowed) {
-    return res.status(402).json({ error: 'Limit reached', upgrade: true, message: 'Upgrade to continue!' });
-  }
-  
-  const isFreeUser = !user.subscription;
-  
-  const languageInstructions = {
-    en: 'Output everything in English.',
-    es: 'Output everything in Spanish (Español).',
-    fr: 'Output everything in French (Français).',
-    pt: 'Output everything in Portuguese (Português).',
-    zh: 'Output everything in Simplified Chinese (简体中文).',
-    hi: 'Output everything in Hindi (हिन्दी).',
-    ar: 'Output everything in Arabic (العربية). Keep JSON keys in English, translate values only.',
-  };
+  const token = req.headers['authorization']?.replace('Bearer ', '');
+  const ip = req.ip || req.headers['x-forwarded-for'];
   
   try {
-    const videoId = await extractYoutubeVideoId(url);
-    if (!videoId) {
-      return res.status(400).json({ error: 'Invalid YouTube URL. Please check the link.' });
+    const session = await validateSession(token);
+    const user = session ? await resetMonthlyUsageIfNeeded(session) : null;
+    
+    const canClean = await canCleanRecipe(user, fingerprint, ip);
+    if (!canClean.allowed) {
+      return res.status(402).json({ 
+        error: canClean.reason, 
+        requiresSignup: canClean.requiresSignup,
+        upgrade: canClean.upgrade,
+        message: canClean.message || 'Upgrade for more recipes!'
+      });
     }
     
-    console.log('🎬 Extracting transcript for video:', videoId);
-    const transcript = await getYoutubeTranscript(videoId);
+    // Extract video ID
+    const videoIdMatch = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/shorts\/)([^&\n?#]+)/);
+    if (!videoIdMatch) return res.status(400).json({ error: 'Invalid YouTube URL.' });
+    const videoId = videoIdMatch[1];
     
+    // Get transcript (simplified - in production use youtube-transcript API)
+    const videoPage = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
+      headers: { 'User-Agent': 'Mozilla/5.0' }
+    });
+    const html = await videoPage.text();
+    
+    // Try to extract captions URL
+    let transcript = '';
+    const baseUrlMatch = html.match(/"baseUrl":\s*"([^"]+timedtext[^"]+)"/);
+    if (baseUrlMatch) {
+      const captionUrl = baseUrlMatch[1].replace(/\\u0026/g, '&');
+      const captionRes = await fetch(captionUrl);
+      const captionData = await captionRes.text();
+      const textMatches = captionData.matchAll(/<text[^>]*>([^<]+)<\/text>/g);
+      transcript = [...textMatches].map(m => m[1]).join(' ');
+    }
+    
+    // Fallback to description
     if (!transcript || transcript.length < 100) {
-      return res.status(400).json({ error: 'Could not extract transcript. This video may not have captions available.' });
+      const descMatch = html.match(/"description":\s*\{"simpleText":\s*"([^"]+)"/);
+      const titleMatch = html.match(/<title>([^<]+)<\/title>/);
+      transcript = `Title: ${titleMatch?.[1] || ''}\nDescription: ${descMatch?.[1]?.replace(/\\n/g, '\n') || ''}`;
     }
     
-    console.log('🤖 Calling Claude API for YouTube transcript...');
+    if (!transcript || transcript.length < 50) {
+      return res.status(400).json({ error: 'Could not extract transcript. Video may not have captions.' });
+    }
+    
+    const langInstr = { en: 'Output in English.', es: 'Output in Spanish.', fr: 'Output in French.', pt: 'Output in Portuguese.', zh: 'Output in Simplified Chinese.', hi: 'Output in Hindi.', ar: 'Output in Arabic.' };
+    
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 3000,
       messages: [{
         role: 'user',
-        content: `Extract the recipe from this cooking video transcript. The speaker is demonstrating how to cook a dish.
-
-VIDEO TRANSCRIPT:
-${transcript.slice(0, 12000)}
-
-RESPOND WITH ONLY VALID JSON (no markdown, no backticks, no explanation):
-{"title":"Recipe name","servings":4,"prepTime":"15 min","cookTime":"30 min","imageUrl":null,"ingredients":["500g / 1.1 lb ingredient","2 tbsp / 30ml oil"],"steps":[{"instruction":"Step description here.","ingredients":["500g / 1.1 lb ingredient"]}],"tips":["optional tip from the video"],"source":"YouTube","sourceUrl":"${url}","author":"Channel name or null"}
-
-CRITICAL RULES:
-- Extract all ingredients mentioned, even if amounts are approximate ("a handful", "some") - convert to reasonable measurements
-- Every measurement MUST have dual units: "500g / 1.1 lb" or "1 cup / 240ml"
-- Temperatures in both: "400°F / 200°C"
-- Each step has "instruction" and "ingredients" array
-- IMPORTANT: The "ingredients" array in each step MUST copy-paste EXACT strings from the main "ingredients" array
-- One clear action per step
-- Include any tips or tricks the chef mentions
-- ${languageInstructions[targetLanguage] || languageInstructions.en}
-- Return ONLY the JSON, nothing else`
+        content: `Extract recipe from this cooking video transcript. Return ONLY valid JSON:\n{"title":"","servings":4,"prepTime":"","cookTime":"","imageUrl":null,"ingredients":["500g / 1.1 lb item"],"steps":[{"instruction":"","ingredients":[]}],"tips":[],"source":"YouTube","sourceUrl":"${url}","author":null}\n\nRULES:\n- Estimate amounts if not stated\n- Dual units\n- Each step has ingredients array\n- ${langInstr[targetLanguage] || langInstr.en}\n\nTRANSCRIPT:\n${transcript.slice(0, 12000)}`
       }]
     });
-
-    console.log('✅ Claude responded');
     
     let text = response.content?.map(c => c.text || '').join('') || '';
     text = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
-      console.error('No JSON found in response:', text.slice(0, 200));
-      throw new Error('No JSON found in response');
-    }
+    const match = text.match(/\{[\s\S]*\}/);
+    if (!match) throw new Error('No JSON');
     
-    let recipe = JSON.parse(jsonMatch[0]);
-    if (!recipe.sourceUrl) recipe.sourceUrl = url;
+    let recipe = JSON.parse(match[0]);
+    recipe.sourceUrl = url;
+    const { recipe: validated, issues } = validateAndFixRecipe(recipe);
+    recipe = validated;
+    if (issues.length) recipe = await fixRecipeIssues(recipe, issues, targetLanguage);
     
-    // Validate and fix any issues
-    const { recipe: validatedRecipe, issues } = validateAndFixRecipe(recipe);
-    recipe = validatedRecipe;
+    trackSpending(CONFIG.COST_PER_URL_RECIPE * 1.5);
     
-    if (issues.length > 0) {
-      recipe = await fixRecipeIssues(recipe, issues, targetLanguage);
-    }
+    if (user) await incrementUserUsage(user);
+    else if (fingerprint) await incrementAnonymousUsage(fingerprint);
     
-    user.recipesUsedThisMonth++;
-    trackSpending(COST_PROTECTION.COST_PER_URL_RECIPE * 1.5, isFreeUser); // YouTube costs a bit more
+    const remaining = user ? getRemainingRecipes({ ...user, recipes_used_this_month: user.recipes_used_this_month + 1 }) 
+                          : Math.max(0, (canClean.remaining || 0) - 1);
     
-    console.log(`✅ YouTube recipe cleaned: ${recipe.title} - ${recipe.steps?.length} steps`);
-    res.json({ recipe, recipesRemaining: getRemainingRecipes(user) });
+    res.json({ recipe, recipesRemaining: remaining });
   } catch (err) {
-    console.error('YouTube clean error:', err);
-    res.status(500).json({ error: 'Failed to extract recipe from video. Please try again.' });
+    console.error('YouTube error:', err);
+    res.status(500).json({ error: 'Failed to extract recipe from video.' });
   }
+});
+
+// =============================================================================
+// SAVED RECIPES
+// =============================================================================
+app.get('/api/recipes/saved', async (req, res) => {
+  const token = req.headers['authorization']?.replace('Bearer ', '');
+  const session = await validateSession(token);
+  if (!session) return res.status(401).json({ error: 'Not authenticated' });
+  
+  const result = await pool.query(
+    'SELECT * FROM saved_recipes WHERE user_id = $1 ORDER BY saved_at DESC',
+    [session.user_id]
+  );
+  
+  const recipes = result.rows.map(r => ({
+    id: r.id,
+    title: r.title,
+    servings: r.servings,
+    prepTime: r.prep_time,
+    cookTime: r.cook_time,
+    imageUrl: r.image_url,
+    ingredients: r.ingredients,
+    steps: r.steps,
+    tips: r.tips,
+    source: r.source,
+    sourceUrl: r.source_url,
+    author: r.author,
+    savedAt: r.saved_at
+  }));
+  
+  res.json({ recipes });
+});
+
+app.post('/api/recipes/save', async (req, res) => {
+  const token = req.headers['authorization']?.replace('Bearer ', '');
+  const session = await validateSession(token);
+  if (!session) return res.status(401).json({ error: 'Not authenticated' });
+  
+  const { recipe } = req.body;
+  
+  await pool.query(
+    `INSERT INTO saved_recipes (user_id, title, servings, prep_time, cook_time, image_url, ingredients, steps, tips, source, source_url, author)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+    [session.user_id, recipe.title, recipe.servings, recipe.prepTime, recipe.cookTime, recipe.imageUrl, 
+     JSON.stringify(recipe.ingredients), JSON.stringify(recipe.steps), JSON.stringify(recipe.tips),
+     recipe.source, recipe.sourceUrl, recipe.author]
+  );
+  
+  res.json({ success: true });
+});
+
+app.delete('/api/recipes/:id', async (req, res) => {
+  const token = req.headers['authorization']?.replace('Bearer ', '');
+  const session = await validateSession(token);
+  if (!session) return res.status(401).json({ error: 'Not authenticated' });
+  
+  await pool.query('DELETE FROM saved_recipes WHERE id = $1 AND user_id = $2', [req.params.id, session.user_id]);
+  res.json({ success: true });
 });
 
 // =============================================================================
 // PAYMENTS
 // =============================================================================
 app.post('/api/payments/create-checkout', async (req, res) => {
-  const { plan, email } = req.body;
+  const { plan } = req.body;
+  const token = req.headers['authorization']?.replace('Bearer ', '');
+  const session = await validateSession(token);
+  if (!session) return res.status(401).json({ error: 'Login required' });
   
-  const prices = { basic: process.env.STRIPE_BASIC_PRICE_ID, unlimited: process.env.STRIPE_UNLIMITED_PRICE_ID };
+  const prices = { 
+    basic: process.env.STRIPE_BASIC_PRICE_ID, 
+    pro: process.env.STRIPE_PRO_PRICE_ID || process.env.STRIPE_UNLIMITED_PRICE_ID 
+  };
   if (!prices[plan]) return res.status(400).json({ error: 'Invalid plan' });
   
-  let user = users.get(email);
-  if (!user) {
-    user = { email, stripeCustomerId: null, recipesUsedThisMonth: 0, monthStarted: new Date().toISOString().slice(0, 7), subscription: null };
-    users.set(email, user);
+  let stripeCustomerId = session.stripe_customer_id;
+  if (!stripeCustomerId) {
+    const customer = await stripe.customers.create({ email: session.email });
+    stripeCustomerId = customer.id;
+    await pool.query('UPDATE users SET stripe_customer_id = $1 WHERE id = $2', [stripeCustomerId, session.user_id]);
   }
   
-  if (!user.stripeCustomerId) {
-    const customer = await stripe.customers.create({ email });
-    user.stripeCustomerId = customer.id;
-  }
-  
-  const session = await stripe.checkout.sessions.create({
-    customer: user.stripeCustomerId,
+  const checkoutSession = await stripe.checkout.sessions.create({
+    customer: stripeCustomerId,
     line_items: [{ price: prices[plan], quantity: 1 }],
     mode: 'subscription',
     success_url: `${process.env.FRONTEND_URL}?success=true&plan=${plan}`,
     cancel_url: `${process.env.FRONTEND_URL}?canceled=true`,
-    metadata: { email, plan },
-    billing_address_collection: 'auto',
-    allow_promotion_codes: true,
-    payment_method_types: ['card'],
+    metadata: { userId: session.user_id.toString(), plan },
   });
-
-  res.json({ url: session.url });
+  
+  res.json({ url: checkoutSession.url });
 });
 
 app.post('/api/payments/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
-
+  
   try {
     event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (err) {
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
-
+  
   if (event.type === 'checkout.session.completed') {
-    const { email, plan } = event.data.object.metadata;
-    const user = getUser(email);
-    if (user) {
-      user.subscription = plan;
-      user.recipesUsedThisMonth = 0;
-      console.log(`✅ ${email} → ${plan}`);
-    }
+    const { userId, plan } = event.data.object.metadata;
+    await pool.query('UPDATE users SET subscription = $1, recipes_used_this_month = 0 WHERE id = $2', [plan, userId]);
+    console.log(`✅ User ${userId} → ${plan}`);
   }
   
   if (event.type === 'customer.subscription.deleted') {
-    const customer = await stripe.customers.retrieve(event.data.object.customer);
-    const user = users.get(customer.email);
-    if (user) user.subscription = null;
+    const customerId = event.data.object.customer;
+    await pool.query('UPDATE users SET subscription = NULL WHERE stripe_customer_id = $1', [customerId]);
   }
-
+  
   res.json({ received: true });
 });
 
 app.get('/api/payments/plans', (req, res) => {
   res.json({
-    free: { name: 'Free', price: 0, recipes: COST_PROTECTION.FREE_RECIPES_PER_MONTH, features: [`${COST_PROTECTION.FREE_RECIPES_PER_MONTH} recipes/month`, 'URL & photo', 'Cooking mode'] },
-    basic: { name: 'Basic', price: 2.99, recipes: 30, features: ['30 recipes/month', 'URL & photo', 'Cooking mode', 'Save recipes'] },
-    unlimited: { name: 'Unlimited', price: 5.99, recipes: 'Unlimited', features: ['Unlimited recipes', 'URL & photo', 'Cooking mode', 'Save recipes', 'Support indie dev ❤️'] },
+    free: { 
+      name: 'Free', price: 0, 
+      features: ['10 recipes to start', '3/month after signup', 'URL, photo & video', 'Cooking mode'] 
+    },
+    basic: { 
+      name: 'Basic', price: 1.99, yearlyPrice: 14.99, recipes: 20,
+      features: ['20 recipes/month', 'URL, photo & video', 'Cooking mode', 'Save recipes', 'Save 37% yearly'] 
+    },
+    pro: { 
+      name: 'Pro', price: 4.99, yearlyPrice: 39.99, recipes: 'Unlimited',
+      features: ['Unlimited recipes', 'URL, photo & video', 'Cooking mode', 'Save recipes', 'Support indie dev ❤️', 'Save 33% yearly'] 
+    },
   });
-});
-
-app.post('/api/payments/portal', async (req, res) => {
-  const email = req.headers['x-user-email'];
-  const user = users.get(email);
-  if (!user?.stripeCustomerId) return res.status(400).json({ error: 'No subscription' });
-  const session = await stripe.billingPortal.sessions.create({ customer: user.stripeCustomerId, return_url: process.env.FRONTEND_URL });
-  res.json({ url: session.url });
 });
 
 // =============================================================================
 // FEEDBACK & RATINGS
 // =============================================================================
-const feedback = [];
-const ratings = [];
-
-app.post('/api/feedback', (req, res) => {
+app.post('/api/feedback', async (req, res) => {
   const { message, type } = req.body;
-  const email = req.headers['x-user-email'] || null;
+  const token = req.headers['authorization']?.replace('Bearer ', '');
+  const session = await validateSession(token);
   
-  if (!message?.trim()) return res.status(400).json({ error: 'Message required' });
+  await pool.query(
+    'INSERT INTO feedback (user_id, email, message, type) VALUES ($1, $2, $3, $4)',
+    [session?.user_id || null, session?.email || null, message, type || 'idea']
+  );
   
-  feedback.unshift({
-    id: Date.now(),
-    message: message.trim(),
-    type: type || 'idea',
-    email,
-    createdAt: new Date().toISOString(),
-    status: 'new',
-    notified: false,
-  });
-  
-  console.log(`💬 Feedback from ${email || 'anonymous'}: ${message.slice(0, 50)}...`);
-  res.json({ success: true, message: 'Thanks! We read every suggestion.' });
+  res.json({ success: true });
 });
 
-app.post('/api/rating', (req, res) => {
+app.post('/api/rating', async (req, res) => {
   const { stars } = req.body;
-  const email = req.headers['x-user-email'] || null;
+  const token = req.headers['authorization']?.replace('Bearer ', '');
+  const session = await validateSession(token);
+  const identifier = session?.user_id?.toString() || req.ip;
   
-  if (!stars || stars < 1 || stars > 5) return res.status(400).json({ error: 'Invalid rating' });
-  
-  const identifier = email || req.ip;
-  const existing = ratings.find(r => r.identifier === identifier);
-  
-  if (existing) {
-    existing.stars = stars;
-    existing.updatedAt = new Date().toISOString();
-  } else {
-    ratings.push({ id: Date.now(), stars, identifier, email, createdAt: new Date().toISOString() });
-  }
+  await pool.query(
+    `INSERT INTO ratings (user_id, identifier, stars) VALUES ($1, $2, $3)
+     ON CONFLICT (identifier) DO UPDATE SET stars = $3, updated_at = NOW()`,
+    [session?.user_id || null, identifier, stars]
+  );
   
   res.json({ success: true });
 });
 
-app.get('/api/ratings/summary', (req, res) => {
-  if (ratings.length === 0) return res.json({ average: 0, count: 0, display: null });
+app.get('/api/ratings/summary', async (req, res) => {
+  const result = await pool.query('SELECT AVG(stars) as avg, COUNT(*) as count FROM ratings');
+  const { avg, count } = result.rows[0];
   
-  const sum = ratings.reduce((acc, r) => acc + r.stars, 0);
-  const average = sum / ratings.length;
-  const count = ratings.length;
-  
-  const display = count >= 5 ? {
-    average: Math.round(average * 10) / 10,
-    count,
-    text: `${average.toFixed(1)} ★ from ${count} cooks`,
-  } : null;
-  
-  res.json({ average, count, display });
-});
-
-// =============================================================================
-// SAVED RECIPES
-// =============================================================================
-app.get('/api/recipes/saved', (req, res) => {
-  const email = req.headers['x-user-email'];
-  if (!email) return res.status(401).json({ error: 'Not authenticated' });
-  res.json({ recipes: savedRecipes.get(email) || [] });
-});
-
-app.post('/api/recipes/save', (req, res) => {
-  const email = req.headers['x-user-email'];
-  if (!email) return res.status(401).json({ error: 'Not authenticated' });
-  const userRecipes = savedRecipes.get(email) || [];
-  userRecipes.unshift({ ...req.body.recipe, id: Date.now(), savedAt: Date.now() });
-  savedRecipes.set(email, userRecipes);
-  res.json({ success: true });
-});
-
-app.delete('/api/recipes/:id', (req, res) => {
-  const email = req.headers['x-user-email'];
-  if (!email) return res.status(401).json({ error: 'Not authenticated' });
-  const userRecipes = savedRecipes.get(email) || [];
-  savedRecipes.set(email, userRecipes.filter(r => r.id !== parseInt(req.params.id)));
-  res.json({ success: true });
-});
-
-// =============================================================================
-// ADMIN
-// =============================================================================
-app.get('/api/admin/feedback', (req, res) => {
-  if (req.headers['x-admin-key'] !== process.env.ADMIN_KEY) return res.status(401).json({ error: 'Unauthorized' });
-  res.json({ total: feedback.length, new: feedback.filter(f => f.status === 'new').length, items: feedback });
-});
-
-app.get('/api/admin/stats', (req, res) => {
-  if (req.headers['x-admin-key'] !== process.env.ADMIN_KEY) return res.status(401).json({ error: 'Unauthorized' });
-  
-  const paidUsers = Array.from(users.values()).filter(u => u.subscription).length;
-  const basicUsers = Array.from(users.values()).filter(u => u.subscription === 'basic').length;
-  const unlimitedUsers = Array.from(users.values()).filter(u => u.subscription === 'unlimited').length;
+  if (count < 5) return res.json({ average: 0, count: 0, display: null });
   
   res.json({
-    users: { total: users.size, paid: paidUsers, basic: basicUsers, unlimited: unlimitedUsers },
-    spending: spendingTracker,
-    mrr: (basicUsers * 2.99) + (unlimitedUsers * 5.99),
-    limits: COST_PROTECTION,
+    average: parseFloat(avg),
+    count: parseInt(count),
+    display: { average: parseFloat(avg).toFixed(1), count: parseInt(count), text: `${parseFloat(avg).toFixed(1)} ★ from ${count} cooks` }
   });
-});
-
-app.post('/api/admin/limits', (req, res) => {
-  if (req.headers['x-admin-key'] !== process.env.ADMIN_KEY) return res.status(401).json({ error: 'Unauthorized' });
-  const { dailyLimit, monthlyLimit, freeRecipes, pause } = req.body;
-  if (dailyLimit !== undefined) COST_PROTECTION.DAILY_SPENDING_LIMIT = dailyLimit;
-  if (monthlyLimit !== undefined) COST_PROTECTION.MONTHLY_SPENDING_LIMIT = monthlyLimit;
-  if (freeRecipes !== undefined) COST_PROTECTION.FREE_RECIPES_PER_MONTH = freeRecipes;
-  if (pause !== undefined) { spendingTracker.paused = pause; spendingTracker.pauseReason = pause ? 'manual' : null; }
-  res.json({ success: true, limits: COST_PROTECTION, paused: spendingTracker.paused });
 });
 
 // =============================================================================
@@ -1102,5 +990,5 @@ app.post('/api/admin/limits', (req, res) => {
 // =============================================================================
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`🍳 mise running on ${PORT} | Daily limit: $${COST_PROTECTION.DAILY_SPENDING_LIMIT} | Monthly: $${COST_PROTECTION.MONTHLY_SPENDING_LIMIT}`);
+  console.log(`🍳 mise running on ${PORT}`);
 });

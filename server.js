@@ -181,6 +181,97 @@ app.get('/api/auth/me', async (req, res) => {
 });
 
 // =============================================================================
+// HELPER: Validate and fix recipe output
+// =============================================================================
+function validateAndFixRecipe(recipe) {
+  const issues = [];
+  
+  // Check required fields
+  if (!recipe.title) recipe.title = 'Recipe';
+  if (!recipe.servings) recipe.servings = 4;
+  if (!recipe.ingredients || !Array.isArray(recipe.ingredients)) recipe.ingredients = [];
+  if (!recipe.steps || !Array.isArray(recipe.steps)) recipe.steps = [];
+  
+  // Check for steps that are too long (likely mashed together)
+  const MAX_STEP_LENGTH = 400;
+  const needsStepSplitting = recipe.steps.some(step => {
+    const text = typeof step === 'string' ? step : step.instruction;
+    return text && text.length > MAX_STEP_LENGTH;
+  });
+  
+  if (needsStepSplitting) {
+    issues.push('steps_too_long');
+  }
+  
+  // Check if too few steps for number of ingredients (likely mashed)
+  if (recipe.ingredients.length > 5 && recipe.steps.length < 3) {
+    issues.push('too_few_steps');
+  }
+  
+  // Check if steps are missing ingredients arrays
+  recipe.steps = recipe.steps.map(step => {
+    if (typeof step === 'string') {
+      return { instruction: step, ingredients: [] };
+    }
+    if (!step.ingredients) step.ingredients = [];
+    return step;
+  });
+  
+  // Check for empty or very short instructions
+  recipe.steps = recipe.steps.filter(step => {
+    const text = step.instruction || '';
+    return text.trim().length > 10;
+  });
+  
+  return { recipe, issues };
+}
+
+// =============================================================================
+// HELPER: Use Claude to fix recipe issues
+// =============================================================================
+async function fixRecipeIssues(recipe, issues) {
+  if (issues.length === 0) return recipe;
+  
+  console.log('🔧 Fixing recipe issues:', issues.join(', '));
+  
+  try {
+    const response = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 3000,
+      messages: [{
+        role: 'user',
+        content: `Fix this recipe JSON. Issues found: ${issues.join(', ')}
+
+CURRENT RECIPE:
+${JSON.stringify(recipe, null, 2)}
+
+FIXES NEEDED:
+${issues.includes('steps_too_long') ? '- Split long steps into individual steps (one action per step, max 300 chars each)' : ''}
+${issues.includes('too_few_steps') ? '- Break down the cooking process into more detailed individual steps' : ''}
+
+RULES:
+- Each step should be ONE clear action (max 300 characters)
+- Each step needs an "ingredients" array with EXACT strings from the main ingredients array used in that step
+- Dual units on all measurements: "500g / 1.1 lb", "1 cup / 240ml", "400°F / 200°C"
+- Return ONLY valid JSON, no explanation`
+      }]
+    });
+    
+    let text = response.content?.map(c => c.text || '').join('') || '';
+    text = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return recipe;
+    
+    const fixed = JSON.parse(jsonMatch[0]);
+    console.log('✅ Recipe fixed:', fixed.steps?.length, 'steps now');
+    return fixed;
+  } catch (err) {
+    console.error('Fix error:', err);
+    return recipe;
+  }
+}
+
+// =============================================================================
 // HELPER: Fetch webpage content
 // =============================================================================
 async function fetchWebpage(url) {
@@ -407,13 +498,26 @@ app.post('/api/recipe/clean-url', async (req, res) => {
       console.log('⚡ Using fast path (JSON-LD schema found)');
       let recipe = convertSchemaToRecipe(schema, url);
       
+      // Validate and check for issues
+      const { recipe: validatedRecipe, issues } = validateAndFixRecipe(recipe);
+      recipe = validatedRecipe;
+      
+      // Fix any issues found
+      if (issues.length > 0) {
+        recipe = await fixRecipeIssues(recipe, issues);
+      }
+      
       // Quick enhancement with Haiku for dual units
       recipe = await enhanceRecipeWithDualUnits(recipe);
       
-      user.recipesUsedThisMonth++;
-      trackSpending(COST_PROTECTION.COST_PER_URL_RECIPE * 0.3, isFreeUser); // Cheaper with Haiku
+      // Final validation
+      const finalCheck = validateAndFixRecipe(recipe);
+      recipe = finalCheck.recipe;
       
-      console.log(`✅ Recipe cleaned (fast): ${recipe.title}`);
+      user.recipesUsedThisMonth++;
+      trackSpending(COST_PROTECTION.COST_PER_URL_RECIPE * 0.5, isFreeUser); // Slightly more with fixes
+      
+      console.log(`✅ Recipe cleaned (fast): ${recipe.title} - ${recipe.steps?.length} steps`);
       return res.json({ recipe, recipesRemaining: getRemainingRecipes(user) });
     }
     
@@ -456,13 +560,21 @@ CRITICAL RULES:
       throw new Error('No JSON found in response');
     }
     
-    const recipe = JSON.parse(jsonMatch[0]);
+    let recipe = JSON.parse(jsonMatch[0]);
     if (!recipe.sourceUrl) recipe.sourceUrl = url;
+    
+    // Validate and fix any issues
+    const { recipe: validatedRecipe, issues } = validateAndFixRecipe(recipe);
+    recipe = validatedRecipe;
+    
+    if (issues.length > 0) {
+      recipe = await fixRecipeIssues(recipe, issues);
+    }
     
     user.recipesUsedThisMonth++;
     trackSpending(COST_PROTECTION.COST_PER_URL_RECIPE, isFreeUser);
     
-    console.log(`✅ Recipe cleaned: ${recipe.title}`);
+    console.log(`✅ Recipe cleaned: ${recipe.title} - ${recipe.steps?.length} steps`);
     res.json({ recipe, recipesRemaining: getRemainingRecipes(user) });
   } catch (err) {
     console.error('Recipe clean error:', err);
@@ -519,11 +631,20 @@ CRITICAL RULES:
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     if (!jsonMatch) throw new Error('No JSON');
     
-    const recipe = JSON.parse(jsonMatch[0]);
+    let recipe = JSON.parse(jsonMatch[0]);
+    
+    // Validate and fix any issues
+    const { recipe: validatedRecipe, issues } = validateAndFixRecipe(recipe);
+    recipe = validatedRecipe;
+    
+    if (issues.length > 0) {
+      recipe = await fixRecipeIssues(recipe, issues);
+    }
+    
     user.recipesUsedThisMonth++;
     trackSpending(COST_PROTECTION.COST_PER_PHOTO_RECIPE, isFreeUser);
     
-    console.log(`✅ Photo recipe cleaned: ${recipe.title}`);
+    console.log(`✅ Photo recipe cleaned: ${recipe.title} - ${recipe.steps?.length} steps`);
     res.json({ recipe, recipesRemaining: getRemainingRecipes(user) });
   } catch (err) {
     console.error('Photo clean error:', err);

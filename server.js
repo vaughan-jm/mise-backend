@@ -191,19 +191,185 @@ async function fetchWebpage(url) {
       }
     });
     const html = await response.text();
-    // Strip HTML tags and get text content (simple extraction)
-    const text = html
-      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
-      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
-      .replace(/<[^>]+>/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .slice(0, 15000); // Limit to ~15k chars to avoid token limits
-    return text;
+    return html;
   } catch (err) {
     console.error('Failed to fetch webpage:', err);
     return null;
   }
+}
+
+// =============================================================================
+// HELPER: Extract JSON-LD Recipe Schema (FAST PATH - no API call needed)
+// =============================================================================
+function extractRecipeSchema(html) {
+  try {
+    // Find all JSON-LD scripts
+    const jsonLdRegex = /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+    let match;
+    
+    while ((match = jsonLdRegex.exec(html)) !== null) {
+      try {
+        let data = JSON.parse(match[1]);
+        
+        // Handle @graph arrays (common in WordPress/Yoast)
+        if (data['@graph']) {
+          data = data['@graph'].find(item => item['@type'] === 'Recipe' || item['@type']?.includes('Recipe'));
+        }
+        
+        // Handle arrays
+        if (Array.isArray(data)) {
+          data = data.find(item => item['@type'] === 'Recipe' || item['@type']?.includes('Recipe'));
+        }
+        
+        // Check if this is a Recipe
+        if (data && (data['@type'] === 'Recipe' || data['@type']?.includes('Recipe'))) {
+          console.log('✅ Found JSON-LD recipe schema!');
+          return data;
+        }
+      } catch (e) {
+        // Invalid JSON, continue searching
+      }
+    }
+    return null;
+  } catch (err) {
+    console.error('Schema extraction error:', err);
+    return null;
+  }
+}
+
+// =============================================================================
+// HELPER: Convert JSON-LD schema to our recipe format
+// =============================================================================
+function convertSchemaToRecipe(schema, sourceUrl) {
+  // Parse ingredients
+  const ingredients = (schema.recipeIngredient || []).map(ing => {
+    // Already a string, just return it (we'll let Claude add dual units if needed later)
+    return ing;
+  });
+  
+  // Parse instructions
+  let steps = [];
+  const instructions = schema.recipeInstructions || [];
+  
+  if (typeof instructions === 'string') {
+    // Single string - split by periods or newlines
+    steps = instructions.split(/\.|\n/).filter(s => s.trim()).map(s => ({
+      instruction: s.trim() + '.',
+      ingredients: []
+    }));
+  } else if (Array.isArray(instructions)) {
+    steps = instructions.map(step => {
+      if (typeof step === 'string') {
+        return { instruction: step, ingredients: [] };
+      } else if (step['@type'] === 'HowToStep') {
+        return { instruction: step.text || step.name || '', ingredients: [] };
+      } else if (step['@type'] === 'HowToSection') {
+        // Handle sections with itemListElement
+        const sectionSteps = (step.itemListElement || []).map(item => ({
+          instruction: item.text || item.name || '',
+          ingredients: []
+        }));
+        return sectionSteps;
+      }
+      return { instruction: String(step), ingredients: [] };
+    }).flat();
+  }
+  
+  // Parse times
+  const parseDuration = (duration) => {
+    if (!duration) return null;
+    const match = duration.match(/PT(?:(\d+)H)?(?:(\d+)M)?/);
+    if (!match) return duration;
+    const hours = parseInt(match[1] || 0);
+    const mins = parseInt(match[2] || 0);
+    if (hours && mins) return `${hours}h ${mins}min`;
+    if (hours) return `${hours}h`;
+    if (mins) return `${mins} min`;
+    return null;
+  };
+  
+  // Get image URL
+  let imageUrl = null;
+  if (schema.image) {
+    if (typeof schema.image === 'string') imageUrl = schema.image;
+    else if (Array.isArray(schema.image)) imageUrl = schema.image[0]?.url || schema.image[0];
+    else if (schema.image.url) imageUrl = schema.image.url;
+  }
+  
+  // Get author
+  let author = null;
+  if (schema.author) {
+    if (typeof schema.author === 'string') author = schema.author;
+    else if (schema.author.name) author = schema.author.name;
+    else if (Array.isArray(schema.author)) author = schema.author[0]?.name || schema.author[0];
+  }
+  
+  return {
+    title: schema.name || 'Recipe',
+    servings: parseInt(schema.recipeYield?.[0] || schema.recipeYield) || 4,
+    prepTime: parseDuration(schema.prepTime),
+    cookTime: parseDuration(schema.cookTime),
+    imageUrl,
+    ingredients,
+    steps,
+    tips: [],
+    source: new URL(sourceUrl).hostname.replace('www.', ''),
+    sourceUrl,
+    author,
+    _needsDualUnits: true, // Flag to indicate we need Claude to add dual units
+  };
+}
+
+// =============================================================================
+// HELPER: Use Claude to enhance recipe with dual units (lightweight call)
+// =============================================================================
+async function enhanceRecipeWithDualUnits(recipe) {
+  try {
+    console.log('🔄 Enhancing recipe with dual units...');
+    const response = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 2500,
+      messages: [{
+        role: 'user',
+        content: `Convert this recipe to have dual units. Return ONLY valid JSON, no explanation.
+
+INPUT:
+${JSON.stringify(recipe, null, 2)}
+
+RULES:
+- Add dual units to ALL measurements: "500g / 1.1 lb", "1 cup / 240ml", "400°F / 200°C"
+- Keep everything else exactly the same
+- For each step, add an "ingredients" array with the EXACT ingredient strings (with dual units) used in that step
+- Return the complete recipe JSON`
+      }]
+    });
+    
+    let text = response.content?.map(c => c.text || '').join('') || '';
+    text = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return recipe;
+    
+    const enhanced = JSON.parse(jsonMatch[0]);
+    delete enhanced._needsDualUnits;
+    return enhanced;
+  } catch (err) {
+    console.error('Enhancement error:', err);
+    delete recipe._needsDualUnits;
+    return recipe; // Return original if enhancement fails
+  }
+}
+
+// =============================================================================
+// HELPER: Strip HTML for fallback
+// =============================================================================
+function stripHtml(html) {
+  return html
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 15000);
 }
 
 // =============================================================================
@@ -228,11 +394,32 @@ app.post('/api/recipe/clean-url', async (req, res) => {
   try {
     // Fetch the webpage content first
     console.log('🌐 Fetching webpage...');
-    const pageContent = await fetchWebpage(url);
+    const html = await fetchWebpage(url);
     
-    if (!pageContent) {
+    if (!html) {
       return res.status(400).json({ error: 'Could not fetch recipe page. Please check the URL.' });
     }
+    
+    // FAST PATH: Try to extract JSON-LD schema (most recipe sites have this)
+    const schema = extractRecipeSchema(html);
+    
+    if (schema) {
+      console.log('⚡ Using fast path (JSON-LD schema found)');
+      let recipe = convertSchemaToRecipe(schema, url);
+      
+      // Quick enhancement with Haiku for dual units
+      recipe = await enhanceRecipeWithDualUnits(recipe);
+      
+      user.recipesUsedThisMonth++;
+      trackSpending(COST_PROTECTION.COST_PER_URL_RECIPE * 0.3, isFreeUser); // Cheaper with Haiku
+      
+      console.log(`✅ Recipe cleaned (fast): ${recipe.title}`);
+      return res.json({ recipe, recipesRemaining: getRemainingRecipes(user) });
+    }
+    
+    // SLOW PATH: Full Claude extraction (fallback for sites without schema)
+    console.log('🐢 Using slow path (no schema, full extraction)');
+    const pageContent = stripHtml(html);
     
     console.log('🤖 Calling Claude API...');
     const response = await anthropic.messages.create({
@@ -246,12 +433,13 @@ WEBPAGE CONTENT:
 ${pageContent}
 
 RESPOND WITH ONLY VALID JSON (no markdown, no backticks, no explanation):
-{"title":"Recipe name","servings":4,"prepTime":"15 min","cookTime":"30 min","imageUrl":null,"ingredients":["500g / 1.1 lb ingredient","2 tbsp / 30ml oil"],"steps":[{"instruction":"Step description here.","ingredients":["relevant ingredient"]}],"tips":["optional tip"],"source":"Website name","sourceUrl":"${url}","author":"Author name or null"}
+{"title":"Recipe name","servings":4,"prepTime":"15 min","cookTime":"30 min","imageUrl":null,"ingredients":["500g / 1.1 lb ingredient","2 tbsp / 30ml oil"],"steps":[{"instruction":"Step description here.","ingredients":["500g / 1.1 lb ingredient"]}],"tips":["optional tip"],"source":"Website name","sourceUrl":"${url}","author":"Author name or null"}
 
-RULES:
+CRITICAL RULES:
 - Every measurement MUST have dual units: "500g / 1.1 lb" or "1 cup / 240ml"
 - Temperatures in both: "400°F / 200°C"
-- Each step has "instruction" and "ingredients" array (ingredients used in that step)
+- Each step has "instruction" and "ingredients" array
+- IMPORTANT: The "ingredients" array in each step MUST copy-paste EXACT strings from the main "ingredients" array - same wording, same amounts, same units. Do not rephrase or abbreviate.
 - One clear action per step
 - Extract tips if mentioned
 - Return ONLY the JSON, nothing else`
@@ -297,7 +485,10 @@ app.post('/api/recipe/clean-photo', async (req, res) => {
   const isFreeUser = !user.subscription;
   
   try {
-    const content = photos.map(photo => {
+    // Compress images if too many - limit to 4 photos max
+    const photosToProcess = photos.slice(0, 4);
+    
+    const content = photosToProcess.map(photo => {
       const matches = photo.match(/^data:(.+);base64,(.+)$/);
       return matches ? { type: 'image', source: { type: 'base64', media_type: matches[1], data: matches[2] } } : null;
     }).filter(Boolean);
@@ -307,18 +498,19 @@ app.post('/api/recipe/clean-photo', async (req, res) => {
       text: `Extract the recipe from these cookbook photos.
 
 RESPOND WITH ONLY VALID JSON (no markdown, no backticks):
-{"title":"Recipe name","servings":4,"prepTime":"15 min","cookTime":"30 min","imageUrl":null,"ingredients":["500g / 1.1 lb ingredient"],"steps":[{"instruction":"Step text","ingredients":[]}],"tips":[],"source":"Cookbook name or 'Cookbook'","sourceUrl":null,"author":"Author or null"}
+{"title":"Recipe name","servings":4,"prepTime":"15 min","cookTime":"30 min","imageUrl":null,"ingredients":["500g / 1.1 lb ingredient"],"steps":[{"instruction":"Step text","ingredients":["500g / 1.1 lb ingredient"]}],"tips":[],"source":"Cookbook name or 'Cookbook'","sourceUrl":null,"author":"Author or null"}
 
-RULES:
+CRITICAL RULES:
 - Dual units always: "500g / 1.1 lb", "1 cup / 240ml", "400°F / 200°C"
 - One action per step
+- IMPORTANT: The "ingredients" array in each step MUST copy-paste EXACT strings from the main "ingredients" array - same wording, same amounts, same units. Do not rephrase or abbreviate.
 - Return ONLY the JSON`
     });
 
     console.log('🤖 Calling Claude API for photos...');
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
-      max_tokens: 2500,
+      max_tokens: 4000,
       messages: [{ role: 'user', content }]
     });
 
